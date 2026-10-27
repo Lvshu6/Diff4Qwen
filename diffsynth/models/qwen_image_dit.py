@@ -572,7 +572,7 @@ class QwenImageDiT(torch.nn.Module):
 
     def __init__(
         self,
-        num_layers: int = 60,
+        num_layers: int = 60, # 60 30
         use_layer3d_rope: bool = False,
         use_additional_t_cond: bool = False,
     ):

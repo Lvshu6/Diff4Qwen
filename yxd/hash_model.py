@@ -135,7 +135,7 @@ def hash_model_file(path, with_shape=True):
 local_model_path="./models"
 # Example: ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="vae/diffusion_pytorch_model.safetensors")
 model_file_path = os.path.join(local_model_path, "Qwen/Qwen-Image", "vae/diffusion_pytorch_model.safetensors")
-model_file_path="./models/LayerAdapter/layer_adapter.safetensors"
+model_file_path="models/LayerEdit/layer_edit_dit_large.safetensors"
 print(model_file_path)
 model_hash = hash_model_file(model_file_path)
 print(model_hash)

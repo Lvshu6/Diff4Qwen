@@ -6,6 +6,12 @@ qwen_image_series = [
         "state_dict_converter": "diffsynth.utils.state_dict_converters.qwen_image_layer_adapter.QwenImageLayerAdapterStateDictConverter",
     },
     {
+        "model_hash": "b0ca6f0d113fbad6042dc6fb6d77b472",
+        "model_name": "qwen_image_dit",
+        "model_class": "diffsynth.models.qwen_image_dit.QwenImageDiT",
+        "extra_kwargs": {"use_layer3d_rope": True, "use_additional_t_cond": True}
+    },
+    {
         # Example: ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="text_encoder/model*.safetensors")
         "model_hash": "0319a1cb19835fb510907dd3367c95ff",
         "model_name": "qwen_image_dit",
@@ -1172,8 +1178,32 @@ ideogram4_series = [
     },
 ]
 
+layer_edit_series = [
+    {
+        # Example: python examples/layer_edit/model_training/dit_init.py --preset small
+        "model_hash": "aa61532dea9e2dc742369424e092b857",
+        "model_name": "layer_edit_dit",
+        "model_class": "diffsynth.models.layer_edit_dit.LayerEditDiT",
+        "extra_kwargs": {"dim": 1536, "ffn_dim": 8960, "num_heads": 12, "num_layers": 30, "cycle_length": 3},
+    },
+    {
+        # Example: python examples/layer_edit/model_training/dit_init.py --preset base
+        "model_hash": "8898844d672f6159fe4b4eeae428d8a7",
+        "model_name": "layer_edit_dit",
+        "model_class": "diffsynth.models.layer_edit_dit.LayerEditDiT",
+        "extra_kwargs": {"dim": 3072, "ffn_dim": 14336, "num_heads": 24, "num_layers": 30, "cycle_length": 3},
+    },
+    {
+        # Example: python examples/layer_edit/model_training/dit_init.py --preset large
+        "model_hash": "abc57a3e1899571f952197809f3e9127",
+        "model_name": "layer_edit_dit",
+        "model_class": "diffsynth.models.layer_edit_dit.LayerEditDiT",
+        "extra_kwargs": {"dim": 5120, "ffn_dim": 13824, "num_heads": 40, "num_layers": 30, "cycle_length": 3},
+    },
+]
+
 MODEL_CONFIGS = (
     stable_diffusion_xl_series + stable_diffusion_series + qwen_image_series + wan_series + flux_series + flux2_series + ernie_image_series
     + z_image_series + ltx2_series + anima_series + mova_series + joyai_image_series + ace_step_series + hidream_o1_image_series
-    + image_metrics_series + ideogram4_series
+    + image_metrics_series + ideogram4_series + layer_edit_series
 )
