@@ -15,11 +15,12 @@ is always treated as clean. The 3D RoPE assigns the layer index to the
 temporal dimension, which lets the model reason about the layer order.
 
 Input tokens (fused-overwrite, the condition layer is always clean):
-    layers   : latents (B, 16, n, h, w) ++ masks[:, :, 1:] (B, 4, n, h, w) on channels
-               -> patchify -> (B, n * h/2 * w/2, 20 * 4)
-    condition: layer_input_image latents (B, 16, 1, h, w) ++ masks[:, :, :1] (B, 4, 1, h, w)
-               -> patchify -> (B, h/2 * w/2, 20 * 4), appended to the tail of the layer tokens
-    tokens   : [layer tokens | condition tokens] -> dit.img_in (Linear) -> (B, L, dim)
+    latents  : latents (B, 16, 1 + n, h, w) ++ masks (B, 4, 1 + n, h, w) on channels
+               -> patchify -> (B, (1 + n) * h/2 * w/2, 20 * 4)
+    condition: first_frame_latents (layer_input_image, B, 16, 1, h, w) ++ all-ones mask (B, 4, 1, h, w)
+               -> patchify -> (B, h/2 * w/2, 20 * 4), repeated for each of the 1 + n frames
+    tokens   : latents ++ condition on channels -> (B, (1 + n) * h/2 * w/2, 2 * 20 * 4)
+               -> dit.img_in (Linear) -> (B, L, dim)
 `patchify` is parameter-free: every 2x2 patch is flattened into the channel dimension.
 `masks` (B, 4, 1 + n, h, w) are aligned with the 1 + n frames: single channel in [0, 1] (white = 1),
 downsampled to the latent resolution and replicated to 4 channels (see LayerEditUnit_MaskEmbedder).
@@ -309,8 +310,9 @@ class LayerEditDiT(torch.nn.Module):
         # The first block of every `cycle_length` consecutive blocks is an A block: A, RGB, RGB, A, ...
         self.cycle_length = cycle_length
 
-        # Parameter-free patchify (see `patchify`), then img_in maps the flattened patches to `dim`.
-        self.img_in = nn.Linear((in_dim + mask_dim) * math.prod(self.patch_size), dim)
+        # Parameter-free patchify (see `patchify`), then img_in maps the flattened patches of
+        # [latents ++ masks] and [first_frame_latents ++ all-ones mask] (concatenated on channels) to `dim`.
+        self.img_in = nn.Linear(2 * (in_dim + mask_dim) * math.prod(self.patch_size), dim)
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim),
             nn.GELU(approximate='tanh'),
@@ -390,30 +392,28 @@ class LayerEditDiT(torch.nn.Module):
         masks: Optional[torch.Tensor] = None,
         num_condition_layers: int = 1,
     ):
-        # x: (B, C, num_condition_layers + n, H, W). Masks are concatenated on channels before patchify.
-        # Tokens: [layer tokens | condition tokens].
+        # x: (B, C, num_condition_layers + n, H, W), frame 0 is the clean first_frame_latents (overwritten).
+        # Masks are concatenated on channels before patchify.
         batch_size = x.shape[0]
+        if num_condition_layers > 1:
+            raise ValueError(f"Only one condition layer (layer_input_image) is supported, got {num_condition_layers}.")
+        # layer_input_image is encoded on its own as an extra condition (like Qwen-Image-Layered).
+        # first_frame_latents ++ all-ones mask -> patchify, then concatenated to the tokens of every frame on channels.
+        condition = x[:, :, :1] if num_condition_layers > 0 else torch.zeros_like(x[:, :, :1])
+        condition = torch.cat([condition, torch.ones_like(condition[:, :1]).repeat(1, self.mask_dim, 1, 1, 1)], dim=1)
+        condition_tokens, _ = self.patchify(condition)
         x = torch.cat([x, self.build_masks(masks, x)], dim=1)
-        condition_latents, layer_latents = x[:, :, :num_condition_layers], x[:, :, num_condition_layers:]
-        layer_tokens, layer_grid = self.patchify(layer_latents)
-        freqs = [self.build_freqs(layer_grid, x.device, frame_offset=num_condition_layers)]
+        x, grid = self.patchify(x)
+        # Tokens are ordered frame by frame, so repeating along the sequence aligns the condition with every frame.
+        x = self.img_in(torch.cat([x, condition_tokens.repeat(1, grid[0], 1)], dim=2))
+        freqs = self.build_freqs(grid, x.device)
         timestep = timestep.reshape(-1)
         if timestep.shape[0] == 1:
             timestep = timestep.repeat(batch_size)
-        timesteps = [timestep.view(batch_size, 1).repeat(1, layer_tokens.shape[1])]
-        tokens = [layer_tokens]
-        condition_grid = (0,) + layer_grid[1:]
-        if num_condition_layers > 0:
-            # layer_input_image is encoded on its own as an extra condition (like Qwen-Image-Layered);
-            # its mask (all ones by default) keeps its channels aligned with the layer tokens.
-            condition_tokens, condition_grid = self.patchify(condition_latents)
-            tokens.append(condition_tokens)
-            freqs.append(self.build_freqs(condition_grid, x.device, frame_offset=0))
-            # The condition layer is clean, so its timestep is 0.
-            timesteps.append(torch.zeros_like(timestep).view(batch_size, 1).repeat(1, condition_tokens.shape[1]))
-        x = self.img_in(torch.cat(tokens, dim=1))
-        freqs = torch.cat(freqs, dim=0)
-        timestep = torch.cat(timesteps, dim=1)
+        timestep = timestep.view(batch_size, 1).repeat(1, grid[0]).clone()
+        # The condition layer is clean, so its timestep is 0.
+        timestep[:, :num_condition_layers] = 0
+        timestep = timestep.unsqueeze(2).repeat(1, 1, grid[1] * grid[2]).flatten(1)
 
         if context.shape[0] != batch_size:
             context = context.repeat(batch_size // context.shape[0], 1, 1)
@@ -424,7 +424,7 @@ class LayerEditDiT(torch.nn.Module):
         context = self.text_embedding(context)
 
         block_kwargs = {"context": context, "t_mod": t_mod, "freqs": freqs}
-        return x, t, (layer_grid, condition_grid), block_kwargs
+        return x, t, grid, block_kwargs
 
     def forward_blocks(
         self,
@@ -474,7 +474,7 @@ class LayerEditDiT(torch.nn.Module):
             only used to route gradients to specific blocks during training (see LayerEditRGBALoss).
         Returns (B, out_dim, 1 + n, H, W), in the same frame order as `x`.
         """
-        x, t, (layer_grid, condition_grid), block_kwargs = self.prepare_block_inputs(x, timestep, context, masks, num_condition_layers)
+        x, t, grid, block_kwargs = self.prepare_block_inputs(x, timestep, context, masks, num_condition_layers)
         hidden_states = [x] if return_hidden_states else None
         x = self.forward_blocks(
             x, 0, len(self.blocks), **block_kwargs,
@@ -483,12 +483,7 @@ class LayerEditDiT(torch.nn.Module):
             hidden_states=hidden_states,
         )
         x = self.head(x, t)
-        # Back to the frame order of the input: [condition | layers].
-        num_layer_tokens = math.prod(layer_grid)
-        x_layers = self.unpatchify(x[:, :num_layer_tokens], layer_grid)
-        if num_condition_layers > 0:
-            x_layers = torch.cat([self.unpatchify(x[:, num_layer_tokens:], condition_grid), x_layers], dim=2)
-        x = x_layers
+        x = self.unpatchify(x, grid)
         if return_hidden_states:
             return x, hidden_states, block_kwargs
         return x

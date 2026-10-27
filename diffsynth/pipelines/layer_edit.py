@@ -216,7 +216,8 @@ class LayerEditUnit_PromptEmbedder(QwenImageUnit_PromptEmbedder):
 class LayerEditUnit_LayerInputImageEmbedder(PipelineUnit):
     """
     Encode layer_input_image with the RGBA VAE and fuse it into the first frame of the latents,
-    in the same way as Wan2.2-TI2V image-to-video generation.
+    in the same way as Wan2.2-TI2V image-to-video generation. The DiT also concatenates it
+    (with an all-ones mask) to the tokens of every frame on channels before img_in.
     """
     def __init__(self):
         super().__init__(
