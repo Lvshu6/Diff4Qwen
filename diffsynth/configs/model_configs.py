@@ -1181,24 +1181,25 @@ ideogram4_series = [
 layer_edit_series = [
     {
         # Example: python examples/layer_edit/model_training/dit_init.py --preset small
-        "model_hash": "f21764a98ac7e480bf39d8424baabf37",
+        "model_hash": "5ad727cbc0d3a04a1112e17a4cfdbe61",
         "model_name": "layer_edit_dit",
         "model_class": "diffsynth.models.layer_edit_dit.LayerEditDiT",
-        "extra_kwargs": {"dim": 1536, "ffn_dim": 8960, "num_heads": 12, "num_layers": 30, "cycle_length": 3},
+        "extra_kwargs": {"dim": 1536, "ffn_dim": 8960, "num_heads": 12, "num_layers": 36, "cycle_length": 3},
     },
     {
         # Example: python examples/layer_edit/model_training/dit_init.py --preset base
-        "model_hash": "9a58ac36d33fa996eac16ea78fb60f97",
+        "model_hash": "1a7144225ebcac8d6d445bab9ba23293",
         "model_name": "layer_edit_dit",
         "model_class": "diffsynth.models.layer_edit_dit.LayerEditDiT",
-        "extra_kwargs": {"dim": 3072, "ffn_dim": 14336, "num_heads": 24, "num_layers": 30, "cycle_length": 3},
+        "extra_kwargs": {"dim": 3072, "ffn_dim": 14336, "num_heads": 24, "num_layers": 36, "cycle_length": 3},
     },
-    {
+    {   #abc57a3e1899571f952197809f3e9127
+     #8178400db56203125bc38b6d23a506f9
         # Example: python examples/layer_edit/model_training/dit_init.py --preset large
-        "model_hash": "8178400db56203125bc38b6d23a506f9",
+        "model_hash": "f728c8bd784f4a50cf447bcf5d0f5be0",
         "model_name": "layer_edit_dit",
         "model_class": "diffsynth.models.layer_edit_dit.LayerEditDiT",
-        "extra_kwargs": {"dim": 5120, "ffn_dim": 13824, "num_heads": 40, "num_layers": 30, "cycle_length": 3},
+        "extra_kwargs": {"dim": 5120, "ffn_dim": 13824, "num_heads": 40, "num_layers": 36, "cycle_length": 3},
     },
 ]
 

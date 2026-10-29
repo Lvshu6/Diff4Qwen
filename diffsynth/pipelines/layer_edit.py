@@ -216,8 +216,8 @@ class LayerEditUnit_PromptEmbedder(QwenImageUnit_PromptEmbedder):
 class LayerEditUnit_LayerInputImageEmbedder(PipelineUnit):
     """
     Encode layer_input_image with the RGBA VAE and fuse it into the first frame of the latents,
-    in the same way as Wan2.2-TI2V image-to-video generation. The DiT also concatenates it
-    (with an all-ones mask) to the tokens of every frame on channels before img_in.
+    in the same way as Wan2.2-TI2V image-to-video generation. The DiT also appends it
+    (with an all-ones mask) after the latent tokens on the sequence-token dimension before img_in.
     """
     def __init__(self):
         super().__init__(
@@ -372,9 +372,9 @@ def LayerEditRGBALoss(
        against the decoded ground truth (the condition frame is excluded).
     3. The flow-matching loss updates every parameter as usual. The RGB / alpha losses only update
        the blocks listed in `rgba_loss_blocks`, each group with its own weights, e.g. the default
-       cyclic pattern (A, RGB, RGB) * 10:
-           A blocks   (0, 3, ..., 27): 0.2 * rgb_loss + 0.8 * alpha_loss
-           RGB blocks (the others)   : 0.8 * rgb_loss + 0.2 * alpha_loss
+       cyclic pattern (A, B, B) * 12 of the 36-block DiT:
+           A blocks (0, 3, ..., 33): 0.2 * rgb_loss + 0.8 * alpha_loss
+           B blocks (the others)   : 0.8 * rgb_loss + 0.2 * alpha_loss
        All other parameters (embeddings, head) receive no gradient from them.
 
     How the gradient is routed (all in one training step, with a single backward pass):

@@ -1,15 +1,15 @@
 """
 examples/layer_edit/model_training/train.py
 Differentiated loss training for different DiT blocks: global flow-match loss stays unchanged.
-Extra constraints: block-1 uses RGB loss weight 0.2, Alpha loss weight 0.8;
-blocks-2/3 use RGB loss weight 0.8, Alpha loss weight 0.2.
+Extra constraints: group-A blocks use RGB loss weight 0.2, Alpha loss weight 0.8;
+group-B blocks use RGB loss weight 0.8, Alpha loss weight 0.2.
 Supports differentiated training in one training iteration.
-Use cyclic pattern A,RGB,RGB repeated for the 3*10=30-layer DiT.
+Use cyclic pattern A,B,B repeated for the 3*12=36-layer DiT.
 Within each triplet:
-- 1st block: self-attention + text-cross-attention
+- 1st block (A): self-attention + text-cross-attention
   (segmentation masks, aligned with [layer_input_image, layer_1, ..., layer_n], enter the DiT as 4 extra
    input channels of the latents, see LayerEditDiT)
-- 2nd & 3rd blocks: self-attention only
+- 2nd & 3rd blocks (B): self-attention only
 Set this cyclic pattern as the default loss configuration.
 """
 import torch, os, argparse, accelerate, warnings
@@ -20,8 +20,8 @@ from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def cyclic_rgba_loss_blocks(num_blocks=30, cycle_length=3, attn_block_weights=(0.2, 0.8), rgb_block_weights=(0.8, 0.2)):
-    # In every cycle, the 1st block (A) gets `attn_block_weights` and the remaining blocks (RGB) get `rgb_block_weights`.
+def cyclic_rgba_loss_blocks(num_blocks=36, cycle_length=3, attn_block_weights=(0.2, 0.8), rgb_block_weights=(0.8, 0.2)):
+    # In every cycle, the 1st block (A) gets `attn_block_weights` and the remaining blocks (B) get `rgb_block_weights`.
     # Format: "first-last:rgb_loss_weight:alpha_loss_weight", e.g. "0:0.2:0.8,1-2:0.8:0.2,3:0.2:0.8,...".
     groups = []
     for start in range(0, num_blocks, cycle_length):
@@ -32,22 +32,23 @@ def cyclic_rgba_loss_blocks(num_blocks=30, cycle_length=3, attn_block_weights=(0
     return ",".join(groups)
 
 
-# RGB / alpha losses routed to block groups, cyclic pattern (A, RGB, RGB) * 10 for the 30-block DiT:
-#   A   (blocks 0, 3, ..., 27; self + text attention): RGB 0.2, alpha 0.8
-#   RGB (the other blocks; self-attention only)      : RGB 0.8, alpha 0.2
+# RGB / alpha losses routed to block groups, cyclic pattern (A, B, B) * 12 for the 36-block DiT:
+#   A (blocks 0, 3, ..., 33; self + text attention): RGB 0.2, alpha 0.8
+#   B (the other blocks; self-attention only)      : RGB 0.8, alpha 0.2
+# `--rgba_loss_blocks` defaults to None: the same pattern is then built from the loaded DiT (num_layers, cycle_length).
 DEFAULT_RGBA_LOSS_BLOCKS = cyclic_rgba_loss_blocks()
 
 
 def check_rgba_loss_blocks(dit, rgba_loss_blocks):
     # Warn if a block group mixes A and RGB blocks, or if A / RGB blocks are not weighted consistently,
-    # e.g. a custom --rgba_loss_blocks that does not follow the (A, RGB, RGB) cycle of the DiT.
+    # e.g. a custom --rgba_loss_blocks that does not follow the (A, B, B) cycle of the DiT.
     weights = {True: set(), False: set()}
     for start, end, rgb_loss_weight, alpha_loss_weight in rgba_loss_blocks:
         for block in dit.blocks[start:end + 1]:
             weights[block.has_text_attn].add((rgb_loss_weight, alpha_loss_weight))
     if len(weights[True]) > 1 or len(weights[False]) > 1 or (weights[True] & weights[False]):
         attn_blocks = [i for i, block in enumerate(dit.blocks) if block.has_text_attn]
-        warnings.warn(f"`rgba_loss_blocks` does not match the DiT layout (A blocks: {attn_blocks}). Weights on A blocks: {weights[True]}, on RGB blocks: {weights[False]}.")
+        warnings.warn(f"`rgba_loss_blocks` does not match the DiT layout (A blocks: {attn_blocks}). Weights on A blocks: {weights[True]}, on B blocks: {weights[False]}.")
 
 
 class LayerEditTrainingModule(DiffusionTrainingModule):
@@ -69,7 +70,7 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
-        rgba_loss_blocks=DEFAULT_RGBA_LOSS_BLOCKS,
+        rgba_loss_blocks=None,
         loss_type="rgba",
     ):
         super().__init__()
@@ -105,6 +106,8 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
         if loss_type not in ("flow_match", "rgba"):
             raise ValueError(f"Unknown loss_type `{loss_type}`, expected `flow_match` or `rgba`.")
         self.loss_type = loss_type
+        if rgba_loss_blocks is None:
+            rgba_loss_blocks = DEFAULT_RGBA_LOSS_BLOCKS if self.pipe.dit is None else cyclic_rgba_loss_blocks(len(self.pipe.dit.blocks), self.pipe.dit.cycle_length)
         self.rgba_loss_blocks = parse_rgba_loss_blocks(rgba_loss_blocks) if loss_type == "rgba" else []
         print(f"Loss type: {loss_type}. RGB / alpha loss block groups (first, last, rgb_weight, alpha_weight): {self.rgba_loss_blocks}")
         if self.pipe.dit is not None and loss_type == "rgba":
@@ -183,7 +186,7 @@ def layer_edit_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--loss_type", type=str, default="rgba", choices=["flow_match", "rgba"], help="flow_match: the common flow-matching loss only. rgba: flow-matching loss + block-routed RGB / alpha losses (see --rgba_loss_blocks).")
-    parser.add_argument("--rgba_loss_blocks", type=str, default=DEFAULT_RGBA_LOSS_BLOCKS, help="RGB / alpha losses (VAE-decoded prediction vs. GT) and the DiT blocks they update, as comma-separated `first-last:rgb_weight:alpha_weight`. Default: cyclic (A, RGB, RGB) * 10, A blocks 0.2:0.8, RGB blocks 0.8:0.2. Other parameters only receive the flow-matching gradient. Empty string disables them.")
+    parser.add_argument("--rgba_loss_blocks", type=str, default=None, help="RGB / alpha losses (VAE-decoded prediction vs. GT) and the DiT blocks they update, as comma-separated `first-last:rgb_weight:alpha_weight`. Default: cyclic (A, B, B) over all DiT blocks (* 12 for 36 blocks), A blocks 0.2:0.8, B blocks 0.8:0.2. Other parameters only receive the flow-matching gradient. Empty string disables them.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     return parser
 

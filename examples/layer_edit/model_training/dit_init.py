@@ -8,10 +8,10 @@ Optional: `--init_from` copies every tensor whose name and shape match from an e
 Wan-Video DiT checkpoint (e.g. Wan2.1-T2V-1.3B for the small preset). Tensors that do not
 match (e.g. text_embedding.0, since Qwen-Image text features are 3584-d, and img_in, which does not
 exist in Wan) keep the random init. Wan also carries cross_attn weights in every block; those of
-the RGB blocks are simply ignored because they only have self-attention.
+the B blocks are simply ignored because they only have self-attention.
 
-The 30 blocks follow the cycle (A, RGB, RGB) * 10: A blocks (0, 3, ..., 27) have self + text
-attention, RGB blocks only have self-attention.
+The 36 blocks follow the cycle (A, B, B) * 12: A blocks (0, 3, ..., 33) have self + text
+attention, B blocks only have self-attention.
 """
 import torch, os, json, argparse
 from safetensors.torch import save_file

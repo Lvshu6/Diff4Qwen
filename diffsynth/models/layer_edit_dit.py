@@ -18,17 +18,19 @@ Input tokens (fused-overwrite, the condition layer is always clean):
     latents  : latents (B, 16, 1 + n, h, w) ++ masks (B, 4, 1 + n, h, w) on channels
                -> patchify -> (B, (1 + n) * h/2 * w/2, 20 * 4)
     condition: first_frame_latents (layer_input_image, B, 16, 1, h, w) ++ all-ones mask (B, 4, 1, h, w)
-               -> patchify -> (B, h/2 * w/2, 20 * 4), repeated for each of the 1 + n frames
-    tokens   : latents ++ condition on channels -> (B, (1 + n) * h/2 * w/2, 2 * 20 * 4)
+               -> patchify -> (B, h/2 * w/2, 20 * 4)
+    tokens   : latents ++ condition on the sequence-token dimension -> (B, (1 + n + 1) * h/2 * w/2, 20 * 4)
                -> dit.img_in (Linear) -> (B, L, dim)
+               The condition tokens are clean (timestep = 0), take the next RoPE frame index (1 + n)
+               and are dropped before the head, so the output keeps the 1 + n frames of the latents.
 `patchify` is parameter-free: every 2x2 patch is flattened into the channel dimension.
 `masks` (B, 4, 1 + n, h, w) are aligned with the 1 + n frames: single channel in [0, 1] (white = 1),
 downsampled to the latent resolution and replicated to 4 channels (see LayerEditUnit_MaskEmbedder).
 Missing masks, including the default mask of layer_input_image, are all ones.
 
-The 30 DiT blocks follow a cyclic pattern A, RGB, RGB repeated 10 times:
-    A   (blocks 0, 3, ..., 27): self-attention + text-cross-attention
-    RGB (all other blocks)    : self-attention only
+The 36 DiT blocks follow a cyclic pattern A, B, B (group A, group B) repeated 12 times:
+    A (blocks 0, 3, ..., 33): self-attention + text-cross-attention
+    B (all other blocks)    : self-attention only
 
 Latents come from the RGBA VAE of Qwen-Image-Layered (z_dim = 16) and the text
 context comes from the Qwen-Image text encoder (hidden size = 3584).
@@ -61,13 +63,13 @@ except ModuleNotFoundError:
 
 
 LAYER_EDIT_DIT_PRESETS = {
-    # All presets: 30 layers = 10 cycles of (A, RGB, RGB).
+    # All presets: 36 layers = 12 cycles of (A, B, B).
     # Same widths as Wan2.1-T2V-1.3B
-    "small": {"dim": 1536, "ffn_dim": 8960, "num_heads": 12, "num_layers": 30, "cycle_length": 3},
+    "small": {"dim": 1536, "ffn_dim": 8960, "num_heads": 12, "num_layers": 36, "cycle_length": 3},
     # Same widths as Wan2.2-TI2V-5B
-    "base": {"dim": 3072, "ffn_dim": 14336, "num_heads": 24, "num_layers": 30, "cycle_length": 3},
+    "base": {"dim": 3072, "ffn_dim": 14336, "num_heads": 24, "num_layers": 36, "cycle_length": 3},
     # Same widths as Wan2.1-T2V-14B
-    "large": {"dim": 5120, "ffn_dim": 13824, "num_heads": 40, "num_layers": 30, "cycle_length": 3},
+    "large": {"dim": 5120, "ffn_dim": 13824, "num_heads": 40, "num_layers": 36, "cycle_length": 3},
 }
 
 
@@ -295,7 +297,7 @@ class LayerEditDiT(torch.nn.Module):
         eps: float = 1e-6,
         patch_size: Tuple[int, int, int] = (1, 2, 2),
         num_heads: int = 12,
-        num_layers: int = 30,
+        num_layers: int = 36,
         cycle_length: int = 3,
         rope_max_len: int = 1024,
     ):
@@ -306,13 +308,13 @@ class LayerEditDiT(torch.nn.Module):
         self.out_dim = out_dim
         self.freq_dim = freq_dim
         self.patch_size = tuple(patch_size)
-        # A blocks: self + text attention. RGB blocks: self-attention only.
-        # The first block of every `cycle_length` consecutive blocks is an A block: A, RGB, RGB, A, ...
+        # A blocks: self + text attention. B blocks: self-attention only.
+        # The first block of every `cycle_length` consecutive blocks is an A block: A, B, B, A, ...
         self.cycle_length = cycle_length
 
         # Parameter-free patchify (see `patchify`), then img_in maps the flattened patches of
-        # [latents ++ masks] and [first_frame_latents ++ all-ones mask] (concatenated on channels) to `dim`.
-        self.img_in = nn.Linear(2 * (in_dim + mask_dim) * math.prod(self.patch_size), dim)
+        # [latents ++ masks] and [first_frame_latents ++ all-ones mask] (concatenated on the sequence) to `dim`.
+        self.img_in = nn.Linear((in_dim + mask_dim) * math.prod(self.patch_size), dim)
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim),
             nn.GELU(approximate='tanh'),
@@ -398,21 +400,24 @@ class LayerEditDiT(torch.nn.Module):
         if num_condition_layers > 1:
             raise ValueError(f"Only one condition layer (layer_input_image) is supported, got {num_condition_layers}.")
         # layer_input_image is encoded on its own as an extra condition (like Qwen-Image-Layered).
-        # first_frame_latents ++ all-ones mask -> patchify, then concatenated to the tokens of every frame on channels.
-        condition = x[:, :, :1] if num_condition_layers > 0 else torch.zeros_like(x[:, :, :1])
-        condition = torch.cat([condition, torch.ones_like(condition[:, :1]).repeat(1, self.mask_dim, 1, 1, 1)], dim=1)
-        condition_tokens, _ = self.patchify(condition)
-        x = torch.cat([x, self.build_masks(masks, x)], dim=1)
-        x, grid = self.patchify(x)
-        # Tokens are ordered frame by frame, so repeating along the sequence aligns the condition with every frame.
-        x = self.img_in(torch.cat([x, condition_tokens.repeat(1, grid[0], 1)], dim=2))
-        freqs = self.build_freqs(grid, x.device)
+        # first_frame_latents ++ all-ones mask -> patchify, then appended after the latent tokens on the sequence.
+        tokens = [torch.cat([x, self.build_masks(masks, x)], dim=1)]
+        if num_condition_layers > 0:
+            condition = x[:, :, :1]
+            tokens.append(torch.cat([condition, torch.ones_like(condition[:, :1]).repeat(1, self.mask_dim, 1, 1, 1)], dim=1))
+        tokens = [self.patchify(t) for t in tokens]
+        grid = tokens[0][1]
+        num_frames = sum(g[0] for _, g in tokens)
+        x = self.img_in(torch.cat([t for t, _ in tokens], dim=1))
+        # The condition tokens take the next frame index of the 3D RoPE, after the 1 + n latent frames.
+        freqs = self.build_freqs((num_frames, grid[1], grid[2]), x.device)
         timestep = timestep.reshape(-1)
         if timestep.shape[0] == 1:
             timestep = timestep.repeat(batch_size)
-        timestep = timestep.view(batch_size, 1).repeat(1, grid[0]).clone()
-        # The condition layer is clean, so its timestep is 0.
+        timestep = timestep.view(batch_size, 1).repeat(1, num_frames).clone()
+        # The condition layer (fused frame 0 and the appended condition tokens) is clean, so its timestep is 0.
         timestep[:, :num_condition_layers] = 0
+        timestep[:, grid[0]:] = 0
         timestep = timestep.unsqueeze(2).repeat(1, 1, grid[1] * grid[2]).flatten(1)
 
         if context.shape[0] != batch_size:
@@ -482,7 +487,9 @@ class LayerEditDiT(torch.nn.Module):
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             hidden_states=hidden_states,
         )
-        x = self.head(x, t)
+        # Drop the appended condition tokens, only the 1 + n latent frames go through the head.
+        num_tokens = math.prod(grid)
+        x = self.head(x[:, :num_tokens], t[:, :num_tokens])
         x = self.unpatchify(x, grid)
         if return_hidden_states:
             return x, hidden_states, block_kwargs

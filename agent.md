@@ -1,33 +1,42 @@
-Create new model architecture: LayerEditDiT for image‑to‑Live2D layered PSD segmentation‑and‑generation task.
+Create the new model architecture `LayerEditDit` for the image‑to‑Live2D layered‑PSD segmentation‑generation task.
 
-`diffsynth/models/wan_video_dit.py`: Adopt Wan‑Video’s fused‑overwrite DiT design. At inference, input `layer_input_image`. Append to‑be‑generated noise afterwards like image‑to‑video. Repurpose video generation for multi‑layer generation; the time dimension becomes layer order. There are `1+n` frames: 1 for overwrite `layer_input_image`, n for segmented output layers. Create a clean complete script `diffsynth/models/layer_edit_dit.py`, removing unused units such as VACE, ControlNet, audio, animate, wan2dance. Patchify uses parameter‑free 2×2 patch flatten‑to‑channel tensor rearrangement. Design `dit.img_in` for dimension transformation.
+`diffsynth/models/wan_video_dit.py`: Adopt the fused‑overwrite DiT design from wan‑video. At inference, take `layer_input_image` as input and concatenate pending‑generation noise afterwards following the image‑to‑video paradigm. Migrate video‑generation logic to multi‑layer generation: repurpose the time dimension as layer order to form a `1+n` sequence — `1` corresponds to the overwrite `layer_input_image`, and `n` corresponds to segmented target layers. Produce a clean standalone script `diffsynth/models/layer_edit_dit.py` by stripping auxiliary plugin units including VACE, ControlNet, audio, animate, and wan2dance. Implement parameter‑free patchify via tensor reshaping that flattens 2×2 patches into the channel dimension. Design `dit.img_in` to project reshaped tensors into DiT‑compatible dimensions.
 
-`diffsynth/models/qwen_image_vae.py`: Reuse RGBA‑VAE with `image_channel=4` from Qwen‑Image‑Layered.
-`diffsynth/models/qwen_image_text_encoder.py`: Reuse text encoder from Qwen‑Image‑Layered.
+`diffsynth/models/qwen_image_vae.py`: Reference the RGBA‑capable VAE with `image_channel=4`. Directly reuse the RGBA VAE from qwen_image_layer.
 
-Implement weight‑initialization script `dit_init.py` for pretraining; output bf16 `.safetensors`.
+`diffsynth/models/qwen_image_text_encoder.py`: Directly reuse the text encoder from qwen_image_layer.
+
+For pretraining, create the weight‑initialization script `dit_init.py` that outputs BF16 `.safetensors` weights.
 
 Port `examples/wanvideo/model_training/train.py` to `examples/layer_edit/model_training/train.py`.
 Port `examples/qwen_image/model_training/Qwen‑Image‑Layered_distill.sh` to `examples/layer_edit/model_training/layer_edit_full.sh`.
-Copy `accelerate_config_14B.yaml` and `accelerate_config_zero3.yaml` from `examples/wanvideo/model_training/full/` to layer_edit folder.
+Copy `examples/wanvideo/model_training/full/accelerate_config_14B.yaml` and `examples/wanvideo/model_training/full/accelerate_config_zero3.yaml` into the layer_edit directory.
 
-Model details for Unit design:
-Key `mask`: list[RGB/RGBA Image], aligned with `1+n` frames. Missing entries default to solid‑white. Extract only RGB values; convert luminance to single‑channel tensors in range `[0,1]` (white=1, black=0). Downsample to latent resolution, replicate single channel to 4 channels. Concatenate mask with latents along channel dimension **before patchify**, then perform patchify to get `x`.
+Model details:
+Unit specification: key `"mask"` accepts `list[Image(RGB/RGBA)]` aligned with the `1+n` sequence. Missing or null entries default to solid‑white masks. Extract RGB‑luminance values, map white to 1 and black to 0 to produce single‑channel masks in the range `[0,1]`. Resize masks to latent resolution, replicate the single channel into 4 channels. Concatenate mask channels to latent tensors **before patchify**, then run patchify to obtain tensor `x`.
 
-Follow `diffsynth/pipelines/qwen_image.py` to process `layer_input_image`: encode independently via VAE as additional condition. Its mask defaults to all‑ones for channel alignment.
+Follow `diffsynth/pipelines/qwen_image.py` to separately VAE‑encode `layer_input_image` as an additional condition; its associated mask defaults to all‑ones for channel alignment.
+Follow the training workflow defined in `examples/wanvideo/model_training/train.py`.
 
-Implement training logic referencing `examples/wanvideo/model_training/train.py`.
+Implement the following constraint: decode the DiT’s final latent output through VAE to get predicted RGBA images, then compute RGB loss and Alpha loss. This loss must apply gradients only to designated DiT blocks; other blocks receive zero gradient from this RGB‑Alpha loss. Do not tap intermediate DiT outputs; compute loss purely from VAE‑decoded final predictions.
 
-Add constraint: decode DiT predicted latents through VAE to obtain predicted RGBA images; compute RGB loss and alpha loss. Apply these losses only to selected DiT blocks, leaving other blocks unaffected. Loss is computed on DiT’s final output after VAE decoding, not on intermediate DiT hidden states.
+Execution pipeline for the RGBA‑Alpha auxiliary loss:
+1. Run full DiT forward pass to obtain the final latent output.
+2. VAE‑decode the final latent to get the predicted RGBA image.
+3. Split predicted RGBA and ground‑truth RGBA, compute RGB loss plus Alpha loss.
+4. Back‑propagate this composite loss only to specified DiT blocks; suppress gradients for all other DiT blocks against this loss signal.
 
-Objectives:
-1. Full DiT forward pass yields final latent output.
-2. VAE decodes final DiT latents into predicted RGBA images.
-3. Split predicted and ground‑truth RGBA, compute RGB loss and alpha loss.
-4. Back‑propagate these losses **only to designated DiT blocks; other DiT blocks receive no gradients from RGBA/alpha loss**.
+Keep the global flow‑match loss unchanged while applying differentiated loss‑weight assignment across DiT blocks:
+‑ Group‑A blocks: RGB loss weight = 0.2, Alpha loss weight = 0.8
+‑ Group‑B blocks: RGB loss weight = 0.8, Alpha loss weight = 0.2
 
-Differentiated loss assignment across DiT blocks: global flow‑match loss remains unchanged. Extra constraints: block‑1 uses RGB weight 0.2 / alpha weight 0.8; block‑2/3 use RGB weight 0.8 / alpha weight 0.2. Within one training step realize cyclic pattern `A, RGB, RGB` repeated 10 times for total 30 DiT blocks. Block‑type‑A contains self‑attention + text‑attention; block‑type‑RGB contains only self‑attention.
+Cycle this triplet pattern for a total of 36 DiT blocks (`3 × 12`), following the repeating sequence `A, B, B, A, B, B …`.
+Within each triplet:
+‑ Group‑A block: self‑attention + text‑attention
+‑ Two Group‑B blocks: self‑attention only
 
-Two loss training modes: the standard `flow_match` from `examples/wanvideo/model_training/train.py`, plus the above RGBA‑block‑routed loss. Switch via one shell parameter.
+Support two training‑loss modes: the original flow‑match loss, and the above RGBA‑Alpha auxiliary loss scheme. Toggle modes via one shell‑script parameter.
 
-For `first_frame_latent` (VAE‑encoded `layer_input_image`): attach all‑one mask channels, apply rearrange, concatenate with rearranged latents on channel dimension, then feed into `img_in` projection.
+Append an all‑ones mask channel to the VAE‑encoded `first_frame_latent` of `layer_input_image`, perform reshaping, concatenate with other latents along the sequence‑token dimension, then feed into the `img_in` projection layer.
+
+Without modifying code, tell me what minimum configuration changes are required for from‑scratch pretraining of the 14B model on a single GPU with a single micro‑batch.
