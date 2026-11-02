@@ -1,3 +1,4 @@
+import inspect
 import torch
 import numpy as np
 from einops import rearrange
@@ -311,7 +312,9 @@ class LayerEditUnit_MaskEmbedder(PipelineUnit):
             for image in mask
         ])  # (1 + n, H, W)
         masks = torch.nn.functional.interpolate(masks.unsqueeze(1), size=(height // 8, width // 8), mode="area")  # (1 + n, 1, h, w)
-        masks = masks.repeat(1, pipe.dit.mask_dim, 1, 1)  # (1 + n, 4, h, w)
+        # The DiT is not loaded in the data process stage (caching), so fall back to its default mask_dim.
+        mask_dim = pipe.dit.mask_dim if pipe.dit is not None else inspect.signature(LayerEditDiT).parameters["mask_dim"].default
+        masks = masks.repeat(1, mask_dim, 1, 1)  # (1 + n, 4, h, w)
         masks = rearrange(masks, "f c h w -> 1 c f h w")
         return {"masks": masks.to(dtype=pipe.torch_dtype, device=pipe.device)}
 
@@ -372,8 +375,8 @@ def LayerEditRGBALoss(
        against the decoded ground truth (the condition frame is excluded).
     3. The flow-matching loss updates every parameter as usual. The RGB / alpha losses only update
        the blocks listed in `rgba_loss_blocks`, each group with its own weights, e.g. the default
-       cyclic pattern (A, B, B) * 12 of the 36-block DiT:
-           A blocks (0, 3, ..., 33): 0.2 * rgb_loss + 0.8 * alpha_loss
+       cyclic pattern (A, B, B) * 20 of the 60-block DiT:
+           A blocks (0, 3, ..., 57): 0.2 * rgb_loss + 0.8 * alpha_loss
            B blocks (the others)   : 0.8 * rgb_loss + 0.2 * alpha_loss
        All other parameters (embeddings, head) receive no gradient from them.
 

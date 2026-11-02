@@ -4,12 +4,12 @@ Differentiated loss training for different DiT blocks: global flow-match loss st
 Extra constraints: group-A blocks use RGB loss weight 0.2, Alpha loss weight 0.8;
 group-B blocks use RGB loss weight 0.8, Alpha loss weight 0.2.
 Supports differentiated training in one training iteration.
-Use cyclic pattern A,B,B repeated for the 3*12=36-layer DiT.
-Within each triplet:
-- 1st block (A): self-attention + text-cross-attention
-  (segmentation masks, aligned with [layer_input_image, layer_1, ..., layer_n], enter the DiT as 4 extra
-   input channels of the latents, see LayerEditDiT)
-- 2nd & 3rd blocks (B): self-attention only
+Use cyclic pattern A,B,B repeated for the 3*20=60-layer DiT.
+All blocks have the same architecture (Qwen-Image-Layered blocks without the text stream, see LayerEditDiT;
+segmentation masks, aligned with [layer_input_image, layer_1, ..., layer_n], enter the DiT as 4 extra
+input channels of the latents). The cycle only groups the blocks for the losses:
+- 1st block of each triplet (A)
+- 2nd & 3rd blocks (B)
 Set this cyclic pattern as the default loss configuration.
 """
 import torch, os, argparse, accelerate, warnings
@@ -20,7 +20,7 @@ from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def cyclic_rgba_loss_blocks(num_blocks=36, cycle_length=3, attn_block_weights=(0.2, 0.8), rgb_block_weights=(0.8, 0.2)):
+def cyclic_rgba_loss_blocks(num_blocks=60, cycle_length=3, attn_block_weights=(0.2, 0.8), rgb_block_weights=(0.8, 0.2)):
     # In every cycle, the 1st block (A) gets `attn_block_weights` and the remaining blocks (B) get `rgb_block_weights`.
     # Format: "first-last:rgb_loss_weight:alpha_loss_weight", e.g. "0:0.2:0.8,1-2:0.8:0.2,3:0.2:0.8,...".
     groups = []
@@ -32,9 +32,9 @@ def cyclic_rgba_loss_blocks(num_blocks=36, cycle_length=3, attn_block_weights=(0
     return ",".join(groups)
 
 
-# RGB / alpha losses routed to block groups, cyclic pattern (A, B, B) * 12 for the 36-block DiT:
-#   A (blocks 0, 3, ..., 33; self + text attention): RGB 0.2, alpha 0.8
-#   B (the other blocks; self-attention only)      : RGB 0.8, alpha 0.2
+# RGB / alpha losses routed to block groups, cyclic pattern (A, B, B) * 20 for the 60-block DiT:
+#   A (blocks 0, 3, ..., 57): RGB 0.2, alpha 0.8
+#   B (the other blocks)    : RGB 0.8, alpha 0.2
 # `--rgba_loss_blocks` defaults to None: the same pattern is then built from the loaded DiT (num_layers, cycle_length).
 DEFAULT_RGBA_LOSS_BLOCKS = cyclic_rgba_loss_blocks()
 
@@ -44,10 +44,10 @@ def check_rgba_loss_blocks(dit, rgba_loss_blocks):
     # e.g. a custom --rgba_loss_blocks that does not follow the (A, B, B) cycle of the DiT.
     weights = {True: set(), False: set()}
     for start, end, rgb_loss_weight, alpha_loss_weight in rgba_loss_blocks:
-        for block in dit.blocks[start:end + 1]:
-            weights[block.has_text_attn].add((rgb_loss_weight, alpha_loss_weight))
+        for i in range(start, min(end + 1, len(dit.blocks))):
+            weights[i % dit.cycle_length == 0].add((rgb_loss_weight, alpha_loss_weight))
     if len(weights[True]) > 1 or len(weights[False]) > 1 or (weights[True] & weights[False]):
-        attn_blocks = [i for i, block in enumerate(dit.blocks) if block.has_text_attn]
+        attn_blocks = list(range(0, len(dit.blocks), dit.cycle_length))
         warnings.warn(f"`rgba_loss_blocks` does not match the DiT layout (A blocks: {attn_blocks}). Weights on A blocks: {weights[True]}, on B blocks: {weights[False]}.")
 
 
@@ -186,7 +186,7 @@ def layer_edit_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--loss_type", type=str, default="rgba", choices=["flow_match", "rgba"], help="flow_match: the common flow-matching loss only. rgba: flow-matching loss + block-routed RGB / alpha losses (see --rgba_loss_blocks).")
-    parser.add_argument("--rgba_loss_blocks", type=str, default=None, help="RGB / alpha losses (VAE-decoded prediction vs. GT) and the DiT blocks they update, as comma-separated `first-last:rgb_weight:alpha_weight`. Default: cyclic (A, B, B) over all DiT blocks (* 12 for 36 blocks), A blocks 0.2:0.8, B blocks 0.8:0.2. Other parameters only receive the flow-matching gradient. Empty string disables them.")
+    parser.add_argument("--rgba_loss_blocks", type=str, default=None, help="RGB / alpha losses (VAE-decoded prediction vs. GT) and the DiT blocks they update, as comma-separated `first-last:rgb_weight:alpha_weight`. Default: cyclic (A, B, B) over all DiT blocks (* 20 for 60 blocks), A blocks 0.2:0.8, B blocks 0.8:0.2. Other parameters only receive the flow-matching gradient. Empty string disables them.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     return parser
 

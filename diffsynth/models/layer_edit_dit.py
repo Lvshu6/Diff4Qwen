@@ -28,9 +28,16 @@ Input tokens (fused-overwrite, the condition layer is always clean):
 downsampled to the latent resolution and replicated to 4 channels (see LayerEditUnit_MaskEmbedder).
 Missing masks, including the default mask of layer_input_image, are all ones.
 
-The 36 DiT blocks follow a cyclic pattern A, B, B (group A, group B) repeated 12 times:
-    A (blocks 0, 3, ..., 33): self-attention + text-cross-attention
-    B (all other blocks)    : self-attention only
+The 60 DiT blocks are the blocks of Qwen-Image-Layered with the text stream removed:
+    text     : context -> text_embedding (Qwen txt_norm + txt_in), then never updated by any block.
+    each block: own timestep projection (img_mod), joint attention where the image tokens attend to
+               [text, image] in one softmax (the text only gives keys / values through add_k_proj /
+               add_v_proj, it is neither normalized nor modulated by the block), image MLP.
+The widths, parameter names and activations of the blocks are those of Qwen-Image-Layered (dim 3072,
+24 heads x 128, MLP 12288), so the DiT is initialized by copying its weights
+(examples/layer_edit/model_training/dit_init.py); the parameters without a counterpart (the mask
+channels of img_in) are randomly initialized. Blocks are grouped in the cycle A, B, B only to route
+the RGB / alpha losses in training (`cycle_length`), the blocks themselves are all the same.
 
 Latents come from the RGBA VAE of Qwen-Image-Layered (z_dim = 16) and the text
 context comes from the Qwen-Image text encoder (hidden size = 3584).
@@ -60,17 +67,6 @@ try:
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
-
-
-LAYER_EDIT_DIT_PRESETS = {
-    # All presets: 36 layers = 12 cycles of (A, B, B).
-    # Same widths as Wan2.1-T2V-1.3B
-    "small": {"dim": 1536, "ffn_dim": 8960, "num_heads": 12, "num_layers": 36, "cycle_length": 3},
-    # Same widths as Wan2.2-TI2V-5B
-    "base": {"dim": 3072, "ffn_dim": 14336, "num_heads": 24, "num_layers": 36, "cycle_length": 3},
-    # Same widths as Wan2.1-T2V-14B
-    "large": {"dim": 5120, "ffn_dim": 13824, "num_heads": 40, "num_layers": 36, "cycle_length": 3},
-}
 
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
@@ -170,54 +166,74 @@ class AttentionModule(nn.Module):
         return x
 
 
-class SelfAttention(nn.Module):
+def select_timestep(x: torch.Tensor, clean: torch.Tensor):
+    # x: (B, 2, ...) computed for [noisy timestep, 0], clean: (L,) bool -> (B, L, ...), clean tokens take index 1.
+    return torch.where(clean.view(1, -1, *([1] * (x.dim() - 2))), x[:, 1:2], x[:, 0:1])
+
+
+class ApproximateGELU(nn.Module):
+    # Same as Qwen-Image: x * sigmoid(1.702 x).
+    def __init__(self, dim_in: int, dim_out: int):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out)
+
+    def forward(self, x):
+        x = self.proj(x)
+        return x * torch.sigmoid(1.702 * x)
+
+
+class FeedForward(nn.Module):
+    # Same layout as QwenFeedForward (net.0.proj, net.2).
+    def __init__(self, dim: int, ffn_dim: int):
+        super().__init__()
+        self.net = nn.ModuleList([ApproximateGELU(dim, ffn_dim), nn.Dropout(0.0), nn.Linear(ffn_dim, dim)])
+
+    def forward(self, x):
+        for module in self.net:
+            x = module(x)
+        return x
+
+
+class JointAttention(nn.Module):
+    """
+    Qwen-Image joint attention without the text stream: only the image tokens are queries, the keys / values
+    are [text, image] in one softmax. The text tokens are projected to keys / values but never updated, so
+    add_q_proj, norm_added_q and to_add_out of Qwen are dropped. The text tokens get no RoPE.
+    """
     def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
+        self.to_q = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(dim, dim)
+        self.to_v = nn.Linear(dim, dim)
+        self.norm_q = RMSNorm(self.head_dim, eps=eps)
+        self.norm_k = RMSNorm(self.head_dim, eps=eps)
+
+        self.add_k_proj = nn.Linear(dim, dim)
+        self.add_v_proj = nn.Linear(dim, dim)
+        self.norm_added_k = RMSNorm(self.head_dim, eps=eps)
+
+        self.to_out = nn.Sequential(nn.Linear(dim, dim))
 
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
+    def head_norm(self, norm: RMSNorm, x: torch.Tensor):
+        # Per-head RMSNorm, like Qwen-Image.
+        return norm(rearrange(x, "b s (n d) -> b s n d", n=self.num_heads)).flatten(2)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, freqs: torch.Tensor):
+        q = self.head_norm(self.norm_q, self.to_q(x))
+        k = self.head_norm(self.norm_k, self.to_k(x))
+        v = self.to_v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
+        k = torch.cat([self.head_norm(self.norm_added_k, self.add_k_proj(context)), k], dim=1)
+        v = torch.cat([self.add_v_proj(context), v], dim=1)
         x = self.attn(q, k, v)
-        return self.o(x)
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
-
-        self.attn = AttentionModule(self.num_heads)
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(y))
-        v = self.v(y)
-        x = self.attn(q, k, v)
-        return self.o(x)
+        return self.to_out(x)
 
 
 class GateModule(nn.Module):
@@ -229,39 +245,31 @@ class GateModule(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6, has_text_attn: bool = True):
+    # The image stream of QwenImageTransformerBlock, with the same parameter names. The text stream
+    # (txt_mod, txt_norm1, txt_norm2, txt_mlp) is removed: the text tokens from text_embedding only serve
+    # as keys / values and are never updated.
+    def __init__(self, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
-        self.has_text_attn = has_text_attn
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
-        if has_text_attn:
-            self.cross_attn = CrossAttention(dim, num_heads, eps)
-            self.norm3 = nn.LayerNorm(dim, eps=eps)
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
-            approximate='tanh'), nn.Linear(ffn_dim, dim))
-        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        # Own timestep projection in every block, like Qwen-Image.
+        self.img_mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        self.img_norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.attn = JointAttention(dim, num_heads, eps)
+        self.img_norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.img_mlp = FeedForward(dim, ffn_dim)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
-        # t_mod: (B, L, 6, dim), one modulation vector per token
+    def forward(self, x, context, temb, clean, freqs):
+        # temb: (B, 2, dim), the embeddings of [noisy timestep, 0]. clean: (L,) bool, the tokens with timestep 0.
         # msa: multi-head self-attention  mlp: multi-layer perceptron
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=2)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
-            shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
-        )
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        if self.has_text_attn:
-            x = x + self.cross_attn(self.norm3(x), context)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = select_timestep(self.img_mod(temb), clean).chunk(6, dim=-1)
+        input_x = modulate(self.img_norm1(x), shift_msa, scale_msa)
+        x = self.gate(x, gate_msa, self.attn(input_x, context, freqs))
+        input_x = modulate(self.img_norm2(x), shift_mlp, scale_mlp)
+        x = self.gate(x, gate_mlp, self.img_mlp(input_x))
         return x
 
 
@@ -271,13 +279,13 @@ class Head(nn.Module):
         self.dim = dim
         self.patch_size = patch_size
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        # Same as Qwen-Image norm_out (AdaLayerNorm, single): linear(silu(temb)) -> (scale, shift).
+        self.linear = nn.Linear(dim, 2 * dim)
         self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
-    def forward(self, x, t):
-        # t: (B, L, dim)
-        shift, scale = (self.modulation.unsqueeze(0).to(dtype=t.dtype, device=t.device) + t.unsqueeze(2)).chunk(2, dim=2)
-        x = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
+    def forward(self, x, temb, clean):
+        scale, shift = select_timestep(self.linear(F.silu(temb)), clean).chunk(2, dim=-1)
+        x = self.head(self.norm(x) * (1 + scale) + shift)
         return x
 
 
@@ -287,17 +295,17 @@ class LayerEditDiT(torch.nn.Module):
 
     def __init__(
         self,
-        dim: int = 1536,
+        dim: int = 3072,
         in_dim: int = 16,
         mask_dim: int = 4,
-        ffn_dim: int = 8960,
+        ffn_dim: int = 12288,
         out_dim: int = 16,
         text_dim: int = 3584,
         freq_dim: int = 256,
         eps: float = 1e-6,
         patch_size: Tuple[int, int, int] = (1, 2, 2),
-        num_heads: int = 12,
-        num_layers: int = 36,
+        num_heads: int = 24,
+        num_layers: int = 60,
         cycle_length: int = 3,
         rope_max_len: int = 1024,
     ):
@@ -308,28 +316,26 @@ class LayerEditDiT(torch.nn.Module):
         self.out_dim = out_dim
         self.freq_dim = freq_dim
         self.patch_size = tuple(patch_size)
-        # A blocks: self + text attention. B blocks: self-attention only.
-        # The first block of every `cycle_length` consecutive blocks is an A block: A, B, B, A, ...
+        # Every block attends to the text. `cycle_length` only groups the blocks for the RGB / alpha losses
+        # in training: the first block of every `cycle_length` consecutive blocks is an A block: A, B, B, A, ...
         self.cycle_length = cycle_length
 
         # Parameter-free patchify (see `patchify`), then img_in maps the flattened patches of
         # [latents ++ masks] and [first_frame_latents ++ all-ones mask] (concatenated on the sequence) to `dim`.
         self.img_in = nn.Linear((in_dim + mask_dim) * math.prod(self.patch_size), dim)
+        # Qwen-Image txt_norm + txt_in. The text tokens are not updated after this.
         self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, dim),
-            nn.GELU(approximate='tanh'),
-            nn.Linear(dim, dim)
+            RMSNorm(text_dim, eps=eps),
+            nn.Linear(text_dim, dim)
         )
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim),
             nn.SiLU(),
             nn.Linear(dim, dim)
         )
-        self.time_projection = nn.Sequential(
-            nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(dim, num_heads, ffn_dim, eps, has_text_attn=layer_id % cycle_length == 0)
-            for layer_id in range(num_layers)
+            DiTBlock(dim, num_heads, ffn_dim, eps)
+            for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, self.patch_size, eps)
         head_dim = dim // num_heads
@@ -337,15 +343,12 @@ class LayerEditDiT(torch.nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # Same initialization strategy as the official Wan-Video DiT.
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        for m in self.text_embedding.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=.02)
+        nn.init.normal_(self.text_embedding[1].weight, std=.02)
         for m in self.time_embedding.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=.02)
@@ -411,25 +414,26 @@ class LayerEditDiT(torch.nn.Module):
         x = self.img_in(torch.cat([t for t, _ in tokens], dim=1))
         # The condition tokens take the next frame index of the 3D RoPE, after the 1 + n latent frames.
         freqs = self.build_freqs((num_frames, grid[1], grid[2]), x.device)
+        # The condition layer (fused frame 0 and the appended condition tokens) is clean, so its timestep is 0.
+        clean = torch.zeros((num_frames,), dtype=torch.bool, device=x.device)
+        clean[:num_condition_layers] = True
+        clean[grid[0]:] = True
+        clean = clean.repeat_interleave(grid[1] * grid[2])
         timestep = timestep.reshape(-1)
         if timestep.shape[0] == 1:
             timestep = timestep.repeat(batch_size)
-        timestep = timestep.view(batch_size, 1).repeat(1, num_frames).clone()
-        # The condition layer (fused frame 0 and the appended condition tokens) is clean, so its timestep is 0.
-        timestep[:, :num_condition_layers] = 0
-        timestep[:, grid[0]:] = 0
-        timestep = timestep.unsqueeze(2).repeat(1, 1, grid[1] * grid[2]).flatten(1)
+        timestep = torch.stack([timestep, torch.zeros_like(timestep)], dim=1)
 
         if context.shape[0] != batch_size:
             context = context.repeat(batch_size // context.shape[0], 1, 1)
-        t = self.time_embedding(
+        # temb: (B, 2, dim), the embeddings of [noisy timestep, 0]. Every block projects it on its own.
+        temb = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).to(x.dtype)
-        ).unflatten(0, (batch_size, -1))
-        t_mod = self.time_projection(t).unflatten(2, (6, self.dim))
+        ).unflatten(0, (batch_size, 2))
         context = self.text_embedding(context)
 
-        block_kwargs = {"context": context, "t_mod": t_mod, "freqs": freqs}
-        return x, t, grid, block_kwargs
+        block_kwargs = {"context": context, "temb": temb, "clean": clean, "freqs": freqs}
+        return x, grid, block_kwargs
 
     def forward_blocks(
         self,
@@ -437,7 +441,8 @@ class LayerEditDiT(torch.nn.Module):
         start: int,
         end: int,
         context: torch.Tensor,
-        t_mod: torch.Tensor,
+        temb: torch.Tensor,
+        clean: torch.Tensor,
         freqs: torch.Tensor,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
@@ -449,7 +454,7 @@ class LayerEditDiT(torch.nn.Module):
                 block,
                 use_gradient_checkpointing and self.training,
                 use_gradient_checkpointing_offload and self.training,
-                x, context, t_mod, freqs
+                x, context, temb, clean, freqs
             )
             if hidden_states is not None:
                 hidden_states.append(x)
@@ -479,7 +484,7 @@ class LayerEditDiT(torch.nn.Module):
             only used to route gradients to specific blocks during training (see LayerEditRGBALoss).
         Returns (B, out_dim, 1 + n, H, W), in the same frame order as `x`.
         """
-        x, t, grid, block_kwargs = self.prepare_block_inputs(x, timestep, context, masks, num_condition_layers)
+        x, grid, block_kwargs = self.prepare_block_inputs(x, timestep, context, masks, num_condition_layers)
         hidden_states = [x] if return_hidden_states else None
         x = self.forward_blocks(
             x, 0, len(self.blocks), **block_kwargs,
@@ -489,7 +494,7 @@ class LayerEditDiT(torch.nn.Module):
         )
         # Drop the appended condition tokens, only the 1 + n latent frames go through the head.
         num_tokens = math.prod(grid)
-        x = self.head(x[:, :num_tokens], t[:, :num_tokens])
+        x = self.head(x[:, :num_tokens], block_kwargs["temb"], block_kwargs["clean"][:num_tokens])
         x = self.unpatchify(x, grid)
         if return_hidden_states:
             return x, hidden_states, block_kwargs
