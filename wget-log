@@ -1,0 +1,7 @@
+--2026-11-02 11:40:02--  https://y.ainsource.com/file/5067f238cg39a512e10d6b3fb30bb716?bkt=en-4d166c0718877615f26510770ea59852d25f6fef6991cf9fb07ddca28f5d701b3f7c104324bfe203
+Resolving y.ainsource.com (y.ainsource.com)... 172.64.152.213
+Connecting to y.ainsource.com (y.ainsource.com)|172.64.152.213|:443... connected.
+HTTP request sent, awaiting response... 400 Bad Request
+Syntax error in Set-Cookie: - at position 1.
+2026-11-02 11:40:05 ERROR 400: Bad Request.
+

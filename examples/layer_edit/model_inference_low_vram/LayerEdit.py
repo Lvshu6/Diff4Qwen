@@ -5,15 +5,15 @@ import torch, json, os, argparse
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dit_path", type=str, default="models/train/LayerEdit_full/epoch-0.safetensors")
+parser.add_argument("--dit_path", type=str, default="models/train/LayerEdit_full_flow_match/epoch-1.safetensors")
 parser.add_argument("--dataset_base_path", type=str, default="data/combine")
 parser.add_argument("--metadata_path", type=str, default="data/combine/test.json")
-parser.add_argument("--output_path", type=str, default="models/train/LayerEdit_full/inference/epoch-0")
+parser.add_argument("--output_path", type=str, default="models/train/LayerEdit_full_flow_match/inference/epoch-1")
 parser.add_argument("--max_pixels", type=int, default=262144)
 parser.add_argument("--num_inference_steps", type=int, default=50)
 parser.add_argument("--cfg_scale", type=float, default=4.0)
 parser.add_argument("--seed", type=int, default=0)
-# Masks are stored as `layer_split_image` in the metadata. Training reads `mask`, so the DiT was trained with all-white masks.
+# Masks are stored as `mask` in the metadata. Training reads `mask`, so the DiT was trained with all-white masks.
 parser.add_argument("--use_mask", default=False, action="store_true")
 parser.add_argument("--onload_dtype", type=str, default="float8_e4m3fn", choices=["float8_e4m3fn", "bfloat16"])
 args = parser.parse_args()
@@ -50,7 +50,7 @@ with open(args.metadata_path) as f:
 for sample_id, data in enumerate(metadata):
     layer_input_image = load_image(data["layer_input_image"])
     width, height = layer_input_image.size
-    mask = [load_image(path) for path in data["layer_split_image"]] if args.use_mask and data.get("layer_split_image") else None
+    mask = [load_image(path) for path in data["mask"]] if args.use_mask and data.get("mask") else None
     layers = pipe(
         data["prompt"],
         seed=args.seed, num_inference_steps=args.num_inference_steps, cfg_scale=args.cfg_scale,
