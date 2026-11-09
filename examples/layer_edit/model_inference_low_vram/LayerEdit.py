@@ -1,20 +1,20 @@
-from diffsynth.pipelines.layer_edit import LayerEditPipeline, ModelConfig
+from diffsynth.pipelines.layer_edit import LayerEditPipeline, LayerEditUnit_MaskEmbedder, ModelConfig
 from diffsynth.core.data.operators import ImageCropAndResize
 from PIL import Image
 import torch, json, os, argparse
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dit_path", type=str, default="models/train/LayerEdit_full_flow_match/epoch-1.safetensors")
-parser.add_argument("--dataset_base_path", type=str, default="data/combine")
-parser.add_argument("--metadata_path", type=str, default="data/combine/test.json")
-parser.add_argument("--output_path", type=str, default="models/train/LayerEdit_full_flow_match/inference/epoch-1")
+parser.add_argument("--dit_path", type=str, default="models/train/LayerEdit_full_flow_match/epoch-3.safetensors")
+parser.add_argument("--dataset_base_path", type=str, default="data/psd/output")
+parser.add_argument("--metadata_path", type=str, default="data/psd/output/test.json")
+parser.add_argument("--output_path", type=str, default="models/train/LayerEdit_full_flow_match/inference/3_7/epoch-3")
 parser.add_argument("--max_pixels", type=int, default=262144)
 parser.add_argument("--num_inference_steps", type=int, default=50)
 parser.add_argument("--cfg_scale", type=float, default=4.0)
 parser.add_argument("--seed", type=int, default=0)
-# Masks are stored as `mask` in the metadata. Training reads `mask`, so the DiT was trained with all-white masks.
-parser.add_argument("--use_mask", default=False, action="store_true")
+# Masks are stored as `mask` in the metadata. Only the tokens inside the masks enter the DiT (sparse inference). --no-use_mask: all tokens enter the DiT.
+parser.add_argument("--use_mask", default=True, action=argparse.BooleanOptionalAction)
 parser.add_argument("--onload_dtype", type=str, default="float8_e4m3fn", choices=["float8_e4m3fn", "bfloat16"])
 args = parser.parse_args()
 ONLOAD_DTYPE = getattr(torch, args.onload_dtype)
@@ -45,12 +45,25 @@ pipe = LayerEditPipeline.from_pretrained(
 resize = ImageCropAndResize(None, None, args.max_pixels, 16, 16)
 load_image = lambda path: resize(Image.open(os.path.join(args.dataset_base_path, path)).convert("RGBA"))
 
+
+def report_tokens(sample_id, mask, layer_num, height, width):
+    frame_tokens = (height // 16) * (width // 16)
+    total = (layer_num + 2) * frame_tokens
+    if mask is None:
+        print(f"Sample {sample_id}: dense, DiT input {total} / {total} tokens.")
+        return
+    masks = LayerEditUnit_MaskEmbedder().process(pipe, mask, layer_num, height, width)["masks"]
+    kept = (pipe.dit.kept_latents(masks, masks)[0, 0].flatten(1).sum(dim=1) // 4).tolist()
+    print(f"Sample {sample_id}: sparse, kept tokens per frame {kept} of {frame_tokens}, DiT input {sum(kept) + frame_tokens} / {total} tokens (with {frame_tokens} condition tokens).")
+
+
 with open(args.metadata_path) as f:
     metadata = json.load(f)
 for sample_id, data in enumerate(metadata):
     layer_input_image = load_image(data["layer_input_image"])
     width, height = layer_input_image.size
-    mask = [load_image(path) for path in data["mask"]] if args.use_mask and data.get("mask") else None
+    mask = [None if path is None else load_image(path) for path in data["mask"]] if args.use_mask and data.get("mask") else None
+    report_tokens(sample_id, mask, data["layer_num"], height, width)
     layers = pipe(
         data["prompt"],
         seed=args.seed, num_inference_steps=args.num_inference_steps, cfg_scale=args.cfg_scale,

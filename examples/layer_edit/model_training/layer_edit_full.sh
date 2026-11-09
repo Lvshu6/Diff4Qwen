@@ -6,7 +6,8 @@
 #   mask (optional) is aligned with the 1 + n frames: mask[0] -> layer_input_image, mask[1..n] -> the n layers.
 #   Missing entries (null, or a shorter list) default to all white. Each mask is converted to a single channel
 #   in [0, 1] (RGB luminance only, white = 1, black = 0), downsampled to the latent resolution, replicated to
-#   4 channels and concatenated to the latents before patchify.
+#   4 channels and concatenated to the latents before patchify. By default, only tokens whose patch has a non-zero mask value enter the DiT.
+#   Add --no-sparse_tokens to Step 2 to keep all tokens; the masks still enter as channels, so no re-caching is needed.
 # Setup: pre-training the 11.4B DiT (60 blocks, widths of Qwen-Image-Layered, initialized from it) on a single GPU, batch size 1.
 #   accelerate_config_14B.yaml: 1 process, ZeRO-2, optimizer states offloaded to CPU,
 #   bf16 weights + grads stay on the GPU; activations are checkpointed and offloaded to CPU.
@@ -15,7 +16,7 @@
 #            and calls torch.autograd.grad inside the step, which is less well supported by ZeRO-3)
 # --max_pixels 1048576 \ 518400 262144
 # Loss type (the only switch, set LOSS_TYPE below or `LOSS_TYPE=flow_match bash layer_edit_full.sh`):
-#   flow_match: the common flow-matching loss only (same as examples/wanvideo/model_training/train.py)
+#   flow_match: the flow-matching loss only, averaged over the tokens inside the masks
 #   rgba      : flow-matching loss + block-routed RGB / alpha losses, described below
 LOSS_TYPE=${LOSS_TYPE:-flow_match}
 # Losses of LOSS_TYPE=rgba (one training run, every iteration):
@@ -32,23 +33,23 @@ LOSS_TYPE=${LOSS_TYPE:-flow_match}
 #   --output_path "models/LayerEdit/layer_edit_dit.safetensors"
 
 # Step 1: cache VAE latents (layers, layer_input_image, masks) and text embeddings
-accelerate launch examples/layer_edit/model_training/train.py \
-  --dataset_base_path data/combine \
-  --dataset_metadata_path data/combine/metadata.json \
-  --data_file_keys "image,layer_input_image,mask" \
-  --max_pixels 100000 \
-  --dataset_repeat 1 \
-  --model_id_with_origin_paths "Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image-Layered:vae/diffusion_pytorch_model.safetensors" \
-  --learning_rate 1e-5 \
-  --num_epochs 1 \
-  --remove_prefix_in_ckpt "pipe.dit." \
-  --output_path "./models/train/LayerEdit_full-cache" \
-  --trainable_models "dit" \
-  --extra_inputs "layer_num,layer_input_image,mask" \
-  --use_gradient_checkpointing \
-  --dataset_num_workers 8 \
-  --task "sft:data_process" \
-> layer_edit_data_process.log 2>&1
+# accelerate launch examples/layer_edit/model_training/train.py \
+#   --dataset_base_path data/psd/output \
+#   --dataset_metadata_path data/psd/merged_output.json \
+#   --data_file_keys "image,layer_input_image,mask" \
+#   --max_pixels 100000 \
+#   --dataset_repeat 1 \
+#   --model_id_with_origin_paths "Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image-Layered:vae/diffusion_pytorch_model.safetensors" \
+#   --learning_rate 1e-5 \
+#   --num_epochs 1 \
+#   --remove_prefix_in_ckpt "pipe.dit." \
+#   --output_path "./models/train/LayerEdit_full-cache" \
+#   --trainable_models "dit" \
+#   --extra_inputs "layer_num,layer_input_image,mask" \
+#   --use_gradient_checkpointing \
+#   --dataset_num_workers 8 \
+#   --task "sft:data_process" \
+# > layer_edit_data_process.log 2>&1
 
 # Step 2: training
 nohup accelerate launch --config_file examples/layer_edit/model_training/full/accelerate_config_14B.yaml examples/layer_edit/model_training/train.py \
@@ -56,7 +57,7 @@ nohup accelerate launch --config_file examples/layer_edit/model_training/full/ac
   --data_file_keys "image,layer_input_image,mask" \
   --max_pixels 100000 \
   --dataset_repeat 1 \
-  --model_paths '["models/LayerEdit/layer_edit_dit.safetensors"]' \
+  --model_paths '["models/LayerEdit/layer_edit_dit_init_from_qwen.safetensors"]' \
   --model_id_with_origin_paths "Qwen/Qwen-Image-Layered:vae/diffusion_pytorch_model.safetensors" \
   --learning_rate 1e-5 \
   --num_epochs 5 \

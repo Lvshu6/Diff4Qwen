@@ -72,6 +72,7 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         rgba_loss_blocks=None,
         loss_type="rgba",
+        sparse_tokens=True,
     ):
         super().__init__()
         # Warning
@@ -101,7 +102,7 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
         self.fp8_models = fp8_models
         self.task = task
         # loss_type:
-        #   flow_match: the common flow-matching loss (FlowMatchSFTLoss, same as examples/wanvideo/model_training/train.py)
+        #   flow_match: the flow-matching loss only (LayerEditRGBALoss without block groups), averaged over the tokens inside the masks
         #   rgba      : flow-matching loss + block-routed RGB / alpha losses (LayerEditRGBALoss)
         if loss_type not in ("flow_match", "rgba"):
             raise ValueError(f"Unknown loss_type `{loss_type}`, expected `flow_match` or `rgba`.")
@@ -112,10 +113,9 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
         print(f"Loss type: {loss_type}. RGB / alpha loss block groups (first, last, rgb_weight, alpha_weight): {self.rgba_loss_blocks}")
         if self.pipe.dit is not None and loss_type == "rgba":
             check_rgba_loss_blocks(self.pipe.dit, self.rgba_loss_blocks)
-        sft_loss = {
-            "flow_match": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
-            "rgba": lambda pipe, inputs_shared, inputs_posi, inputs_nega: LayerEditRGBALoss(pipe, rgba_loss_blocks=self.rgba_loss_blocks, **inputs_shared, **inputs_posi),
-        }[loss_type]
+        # Passed here and not in get_pipeline_inputs: the sft:train task reads its inputs from the cache.
+        print(f"Sparse tokens: {sparse_tokens}.")
+        sft_loss = lambda pipe, inputs_shared, inputs_posi, inputs_nega: LayerEditRGBALoss(pipe, rgba_loss_blocks=self.rgba_loss_blocks, sparse_tokens=sparse_tokens, **inputs_shared, **inputs_posi)
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -187,6 +187,7 @@ def layer_edit_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--loss_type", type=str, default="rgba", choices=["flow_match", "rgba"], help="flow_match: the common flow-matching loss only. rgba: flow-matching loss + block-routed RGB / alpha losses (see --rgba_loss_blocks).")
     parser.add_argument("--rgba_loss_blocks", type=str, default=None, help="RGB / alpha losses (VAE-decoded prediction vs. GT) and the DiT blocks they update, as comma-separated `first-last:rgb_weight:alpha_weight`. Default: cyclic (A, B, B) over all DiT blocks (* 20 for 60 blocks), A blocks 0.2:0.8, B blocks 0.8:0.2. Other parameters only receive the flow-matching gradient. Empty string disables them.")
+    parser.add_argument("--sparse_tokens", default=True, action=argparse.BooleanOptionalAction, help="Only the tokens inside the masks enter the DiT (default). --no-sparse_tokens: all tokens enter the DiT, and the masks still enter as input channels.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     return parser
 
@@ -254,6 +255,7 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         rgba_loss_blocks=args.rgba_loss_blocks,
         loss_type=args.loss_type,
+        sparse_tokens=args.sparse_tokens,
     )
     model_logger = ModelLogger(
         args.output_path,

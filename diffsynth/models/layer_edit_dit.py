@@ -28,6 +28,11 @@ Input tokens (fused-overwrite, the condition layer is always clean):
 downsampled to the latent resolution and replicated to 4 channels (see LayerEditUnit_MaskEmbedder).
 Missing masks, including the default mask of layer_input_image, are all ones.
 
+Sparse tokens (`sparse_tokens=True`, the default): only the latent tokens whose 2x2 patch has a non-zero mask value enter img_in and the blocks,
+with the RoPE positions and timesteps of their original places. Without masks, nothing is dropped. The head
+output is spliced back to the full (1 + n) * h/2 * w/2 tokens, with zeros at the dropped tokens, so the
+output is always a complete latent for the VAE. The pipeline fills the dropped regions (see LayerEditPipeline).
+
 The 60 DiT blocks are the blocks of Qwen-Image-Layered with the text stream removed:
     text     : context -> text_embedding (Qwen txt_norm + txt_in), then never updated by any block.
     each block: own timestep projection (img_mod), joint attention where the image tokens attend to
@@ -389,6 +394,18 @@ class LayerEditDiT(torch.nn.Module):
             masks = masks.repeat(b // masks.shape[0], 1, 1, 1, 1)
         return masks.to(dtype=x.dtype, device=x.device)
 
+    def select_tokens(self, masks: torch.Tensor):
+        # masks: (B, mask_dim, F, H, W) -> (F * H/2 * W/2,) bool. A token is kept if any cell of its patch is non-zero,
+        # so every region with mask = 1 is covered. The selection is shared by the batch (union of the masks).
+        return self.patchify(masks)[0].amax(dim=(0, 2)) > 0
+
+    def kept_latents(self, masks: Optional[torch.Tensor], x: torch.Tensor):
+        # x: (B, C, F, H, W) -> (1, 1, F, H, W) bool, the latent cells whose tokens enter the DiT.
+        masks = self.build_masks(masks, x)
+        tokens, grid = self.patchify(masks)
+        keep = self.select_tokens(masks).view(1, -1, 1).expand(-1, -1, tokens.shape[2] // masks.shape[1])
+        return self.unpatchify(keep, grid)
+
     def prepare_block_inputs(
         self,
         x: torch.Tensor,
@@ -396,6 +413,7 @@ class LayerEditDiT(torch.nn.Module):
         context: torch.Tensor,
         masks: Optional[torch.Tensor] = None,
         num_condition_layers: int = 1,
+        sparse_tokens: bool = True,
     ):
         # x: (B, C, num_condition_layers + n, H, W), frame 0 is the clean first_frame_latents (overwritten).
         # Masks are concatenated on channels before patchify.
@@ -404,21 +422,26 @@ class LayerEditDiT(torch.nn.Module):
             raise ValueError(f"Only one condition layer (layer_input_image) is supported, got {num_condition_layers}.")
         # layer_input_image is encoded on its own as an extra condition (like Qwen-Image-Layered).
         # first_frame_latents ++ all-ones mask -> patchify, then appended after the latent tokens on the sequence.
-        tokens = [torch.cat([x, self.build_masks(masks, x)], dim=1)]
+        masks = self.build_masks(masks, x)
+        # With sparse_tokens=False, the masks still enter as channels, but every token is kept.
+        keep = self.select_tokens(masks if sparse_tokens else torch.ones_like(masks))
+        tokens = [torch.cat([x, masks], dim=1)]
         if num_condition_layers > 0:
             condition = x[:, :, :1]
             tokens.append(torch.cat([condition, torch.ones_like(condition[:, :1]).repeat(1, self.mask_dim, 1, 1, 1)], dim=1))
         tokens = [self.patchify(t) for t in tokens]
         grid = tokens[0][1]
         num_frames = sum(g[0] for _, g in tokens)
-        x = self.img_in(torch.cat([t for t, _ in tokens], dim=1))
+        # Drop the latent tokens outside the masks. The condition tokens are always kept.
+        keep_all = torch.cat([keep, torch.ones(tokens[1][0].shape[1], dtype=torch.bool, device=keep.device)]) if num_condition_layers > 0 else keep
+        x = self.img_in(torch.cat([t for t, _ in tokens], dim=1)[:, keep_all])
         # The condition tokens take the next frame index of the 3D RoPE, after the 1 + n latent frames.
-        freqs = self.build_freqs((num_frames, grid[1], grid[2]), x.device)
+        freqs = self.build_freqs((num_frames, grid[1], grid[2]), x.device)[keep_all]
         # The condition layer (fused frame 0 and the appended condition tokens) is clean, so its timestep is 0.
         clean = torch.zeros((num_frames,), dtype=torch.bool, device=x.device)
         clean[:num_condition_layers] = True
         clean[grid[0]:] = True
-        clean = clean.repeat_interleave(grid[1] * grid[2])
+        clean = clean.repeat_interleave(grid[1] * grid[2])[keep_all]
         timestep = timestep.reshape(-1)
         if timestep.shape[0] == 1:
             timestep = timestep.repeat(batch_size)
@@ -433,7 +456,7 @@ class LayerEditDiT(torch.nn.Module):
         context = self.text_embedding(context)
 
         block_kwargs = {"context": context, "temb": temb, "clean": clean, "freqs": freqs}
-        return x, grid, block_kwargs
+        return x, grid, keep, block_kwargs
 
     def forward_blocks(
         self,
@@ -467,6 +490,7 @@ class LayerEditDiT(torch.nn.Module):
         context: torch.Tensor,
         masks: Optional[torch.Tensor] = None,
         num_condition_layers: int = 1,
+        sparse_tokens: bool = True,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         return_hidden_states: bool = False,
@@ -479,12 +503,13 @@ class LayerEditDiT(torch.nn.Module):
         context: (B, S, text_dim), text embeddings from the Qwen-Image text encoder.
         masks: (B, mask_dim, 1 + n, H, W) in [0, 1], optional. Segmentation masks at the latent resolution,
             aligned with the frames of x. Defaults to all ones.
+        sparse_tokens: if True, tokens outside the masks do not enter the blocks. If False, all tokens do.
         return_hidden_states: if True, also return `hidden_states` (hidden_states[i] is the input of
             block i, hidden_states[-1] is the output of the last block) and `block_kwargs`. They are
             only used to route gradients to specific blocks during training (see LayerEditRGBALoss).
-        Returns (B, out_dim, 1 + n, H, W), in the same frame order as `x`.
+        Returns (B, out_dim, 1 + n, H, W), in the same frame order as `x`, zero at the dropped tokens.
         """
-        x, grid, block_kwargs = self.prepare_block_inputs(x, timestep, context, masks, num_condition_layers)
+        x, grid, keep, block_kwargs = self.prepare_block_inputs(x, timestep, context, masks, num_condition_layers, sparse_tokens)
         hidden_states = [x] if return_hidden_states else None
         x = self.forward_blocks(
             x, 0, len(self.blocks), **block_kwargs,
@@ -492,10 +517,13 @@ class LayerEditDiT(torch.nn.Module):
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             hidden_states=hidden_states,
         )
-        # Drop the appended condition tokens, only the 1 + n latent frames go through the head.
-        num_tokens = math.prod(grid)
+        # Drop the appended condition tokens, only the kept tokens of the 1 + n latent frames go through the head.
+        num_tokens = int(keep.sum())
         x = self.head(x[:, :num_tokens], block_kwargs["temb"], block_kwargs["clean"][:num_tokens])
-        x = self.unpatchify(x, grid)
+        # Splice the tokens back to the complete latent.
+        output = x.new_zeros((x.shape[0], keep.shape[0], x.shape[2]))
+        output[:, keep] = x
+        x = self.unpatchify(output, grid)
         if return_hidden_states:
             return x, hidden_states, block_kwargs
         return x

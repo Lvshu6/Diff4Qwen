@@ -1,1 +1,2 @@
-layer
+layer_edit 接受mask键输入，可不可以在进入dit前只将mask为1的区域的对应image latent 的token输入,dit计算后再将这些token拼接回去vae解码，vae编解码需要完整latent，但dit只需要token，可以利用mask减少进入dit的token
+Layer_edit accepts mask-key input. Before feeding into the DiT, we only feed the image latent tokens corresponding to regions where mask equals 1. After DiT computation, these tokens are spliced back for VAE decoding. The VAE requires a complete latent for encoding and decoding, while DiT only needs sparse tokens. We can leverage the mask to reduce the number of tokens entering DiT.

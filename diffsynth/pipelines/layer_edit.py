@@ -155,6 +155,11 @@ class LayerEditPipeline(BasePipeline):
         # Decode (skip the condition frame)
         self.load_models_to_device(["vae"])
         latents = inputs_shared["latents"]
+        # The DiT did not denoise the tokens outside the masks, these regions are transparent.
+        keep = self.dit.kept_latents(inputs_shared.get("masks"), latents)
+        if not keep.all():
+            transparent = Image.new("RGBA", (inputs_shared["width"], inputs_shared["height"]), (0, 0, 0, 0))
+            latents = torch.where(keep, latents, self.encode_rgba_image(transparent, inputs_shared["height"], inputs_shared["width"]))
         if "first_frame_latents" in inputs_shared:
             latents = latents[:, :, inputs_shared["first_frame_latents"].shape[2]:]
         layers = []
@@ -365,10 +370,13 @@ def rgba_losses(pipe: LayerEditPipeline, x0_pred: torch.Tensor, x0_target: torch
 def LayerEditRGBALoss(
     pipe: LayerEditPipeline,
     rgba_loss_blocks: list = (),
+    sparse_tokens: bool = True,
     **inputs,
 ):
     """
-    Flow-matching loss (global) + block-routed RGB / alpha losses.
+    Flow-matching loss (global) + block-routed RGB / alpha losses. Without `rgba_loss_blocks`, only the flow-matching loss.
+    Tokens outside the masks do not enter the DiT, so the flow-matching loss is averaged over the kept latent cells,
+    and the target latents fill the dropped regions before decoding. With `sparse_tokens=False`, no tokens are dropped.
 
     1. The full DiT forward pass produces the final prediction v.
     2. x0 = x_t - sigma * v is decoded by the RGBA VAE, and RGB / alpha losses are computed
@@ -410,14 +418,14 @@ def LayerEditRGBALoss(
     # 1. Full DiT forward pass
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     use_rgba_loss = len(rgba_loss_blocks) > 0
-    output = pipe.model_fn(**models, **inputs, timestep=timestep, return_hidden_states=use_rgba_loss)
+    output = pipe.model_fn(**models, **inputs, timestep=timestep, sparse_tokens=sparse_tokens, return_hidden_states=use_rgba_loss)
     noise_pred, hidden_states, block_kwargs = output if use_rgba_loss else (output, None, None)
 
+    keep = pipe.dit.kept_latents(inputs.get("masks") if sparse_tokens else None, inputs["latents"])[:, :, num_condition_layers:]
     training_weight = pipe.scheduler.training_weight(timestep)
-    loss = torch.nn.functional.mse_loss(
-        noise_pred[:, :, num_condition_layers:].float(),
-        training_target[:, :, num_condition_layers:].float(),
-    ) * training_weight
+    error = (noise_pred[:, :, num_condition_layers:].float() - training_target[:, :, num_condition_layers:].float()).pow(2)
+    keep_error = keep.expand_as(error)
+    loss = (error * keep_error).sum() / keep_error.sum().clamp_min(1) * training_weight
     if not use_rgba_loss:
         return loss
 
@@ -435,7 +443,7 @@ def LayerEditRGBALoss(
     sigma = pipe.scheduler.sigmas[timestep_id].to(dtype=noise_pred.dtype, device=noise_pred.device)
     x0_pred = inputs["latents"][:, :, num_condition_layers:] - sigma * noise_pred_layers
     x0_target = inputs["input_latents"][:, :, num_condition_layers:]
-    rgb_loss, alpha_loss = rgba_losses(pipe, x0_pred, x0_target)
+    rgb_loss, alpha_loss = rgba_losses(pipe, torch.where(keep, x0_pred, x0_target), x0_target)
     grad_rgb, = torch.autograd.grad(rgb_loss, noise_pred_layers, retain_graph=True)
     grad_alpha, = torch.autograd.grad(alpha_loss, noise_pred_layers)
     del x0_pred, noise_pred_layers
@@ -474,6 +482,7 @@ def model_fn_layer_edit(
     context=None,
     masks=None,
     first_frame_latents=None,
+    sparse_tokens=True,
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
     return_hidden_states=False,
@@ -484,6 +493,7 @@ def model_fn_layer_edit(
         latents, timestep, context,
         masks=masks,
         num_condition_layers=num_condition_layers,
+        sparse_tokens=sparse_tokens,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         return_hidden_states=return_hidden_states,

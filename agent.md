@@ -71,11 +71,22 @@ Adapt video-generation logic to multiple layers by treating the time dimension a
 
 The condition image therefore appears twice: as overwritten frame 0 and as the appended condition tokens. The appended tokens take RoPE layer index `1 + n`.
 
+### Sparse tokens
+
+The VAE needs a complete latent, but the DiT only needs tokens, so masks reduce the tokens entering the DiT:
+
+- Keep a latent token if any cell of its 2x2 patch has a mask value above 0. Patches partly covered by a mask are kept, so every region with mask = 1 is covered.
+- Select tokens after patchify and before `img_in`. Kept tokens keep the RoPE positions and timesteps of their original places. Appended condition tokens are always kept.
+- With no `mask`, or all-white masks, no tokens are dropped.
+- In training, `--sparse_tokens` is on by default. `--no-sparse_tokens` keeps all tokens while masks still enter as channels, and needs no re-caching.
+- The selection is shared across a batch, as the union of its masks.
+- This adds no parameters, so existing weights and the model hash are unaffected.
+
 ### Timesteps and output
 
 - Compute `temb` for two values, `[noisy timestep, 0]`. Each block projects both through its own `img_mod`, then selects per token.
 - Frame 0 and the appended condition tokens use timestep 0. Frames 1 to n use the noisy timestep.
-- Drop the appended condition tokens before `Head`, then unpatchify. The output is `(B, 16, 1 + n, h, w)`, in the same frame order as the input latents.
+- Drop the appended condition tokens before `Head`. Splice the kept tokens back into a complete token sequence, with zeros at dropped tokens, then unpatchify. The output is `(B, 16, 1 + n, h, w)`, in the same frame order as the input latents.
 
 ## Pipeline units
 
@@ -96,7 +107,7 @@ The `"mask"` key holds `list[Image (RGB/RGBA) | None]`, aligned with the `1 + n`
 2. Convert to RGB, which drops alpha without compositing, then to luminance. This gives one single-channel tensor per frame in the closed range [0, 1], with white = 1 and black = 0.
 3. Resize to pixel size, then downsample to the latent size with area interpolation.
 4. Replicate the single channel to `mask_dim` (4) channels, giving `(1, 4, 1 + n, h, w)`.
-5. The DiT concatenates masks with latents on channels before patchify.
+5. The DiT concatenates masks with latents on channels before patchify, and uses them to select tokens (see Sparse tokens).
 
 The DiT is not loaded during data caching. In that case, read `mask_dim` from the default value in the `LayerEditDiT` signature.
 
@@ -104,7 +115,7 @@ The appended condition tokens always use the all-ones mask. `mask[0]` applies on
 
 ### Inference
 
-`pipe(prompt, layer_input_image=..., layer_num=..., mask=..., ...)` skips the condition frame when decoding, and decodes each of the `n` layers separately. It returns a list of `n` RGBA images.
+`pipe(prompt, layer_input_image=..., layer_num=..., mask=..., ...)` fills latent cells outside the masks with the VAE encoding of a fully transparent image, skips the condition frame when decoding, and decodes each of the `n` layers separately. It returns a list of `n` RGBA images.
 
 ## Weight initialization
 
@@ -145,10 +156,12 @@ After changing the architecture, rerun `dit_init.py` and update `model_hash` in 
 
 `layer_edit_full.sh` selects the mode with one variable, `LOSS_TYPE`, passed to `--loss_type`. The script defaults to `flow_match`; `train.py` used directly defaults to `rgba`.
 
-- **`flow_match`:** `FlowMatchSFTLoss`. MSE on frames 1 to n; the condition frame is excluded.
-- **`rgba`:** `LayerEditRGBALoss`. The same flow-matching loss on all parameters, plus RGB and alpha losses routed to specific blocks:
+Both modes use `LayerEditRGBALoss`.
+
+- **`flow_match`:** MSE on frames 1 to n, averaged over kept latent cells. The condition frame and dropped tokens are excluded.
+- **`rgba`:** The same flow-matching loss on all parameters, plus RGB and alpha losses routed to specific blocks:
   1. Run the full DiT forward pass to get the final prediction `v`.
-  2. Compute `x0 = x_t - sigma * v` and decode it with the frozen RGBA VAE. Decode the target latents the same way. Exclude the condition frame.
+  2. Compute `x0 = x_t - sigma * v`, fill dropped cells from the target latents, and decode with the frozen RGBA VAE. Decode the target latents the same way. Exclude the condition frame.
   3. Compute `alpha_loss` as the MSE of alpha in [0, 1], and `rgb_loss` as the squared RGB error weighted by the target alpha.
   4. Route the gradients to the blocks only, with the default weights below. Embeddings and the head get no gradient from these losses. Do not compute a loss on intermediate hidden states.
 
@@ -177,4 +190,4 @@ Current settings: `--max_pixels 100000`, `--learning_rate 1e-5`, `--num_epochs 5
 
 ## Low-VRAM inference
 
-`LayerEdit.py` reads samples from `--metadata_path`, runs the pipeline with disk offload, and writes `input.png`, `layer_N.png`, and `layer_N_gt.png` for each sample. Defaults: `--max_pixels 262144`, `--num_inference_steps 50`, `--cfg_scale 4.0`, `--seed 0`, `--onload_dtype float8_e4m3fn`. Masks are used only with `--use_mask`.
+`LayerEdit.py` reads samples from `--metadata_path`, runs the pipeline with disk offload, and writes `input.png`, `layer_N.png`, and `layer_N_gt.png` for each sample. Defaults: `--max_pixels 262144`, `--num_inference_steps 50`, `--cfg_scale 4.0`, `--seed 0`, `--onload_dtype float8_e4m3fn`. Masks are used by default, so inference is sparse and prints the kept tokens per sample; `--no-use_mask` sends all tokens to the DiT.
