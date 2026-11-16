@@ -1181,7 +1181,7 @@ ideogram4_series = [
 layer_edit_series = [
     {
         # Example: python examples/layer_edit/model_training/dit_init.py
-        "model_hash": "205828124c3c03cbfc40e542b8d48049",
+        "model_hash": "2e0ef4e8b2dba2cbe5bfa9b0951a351a",
         "model_name": "layer_edit_dit",
         "model_class": "diffsynth.models.layer_edit_dit.LayerEditDiT",
         "extra_kwargs": {"dim": 3072, "ffn_dim": 12288, "num_heads": 24, "num_layers": 60, "cycle_length": 3},

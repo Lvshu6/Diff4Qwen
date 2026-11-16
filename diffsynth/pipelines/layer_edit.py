@@ -1,5 +1,6 @@
 import inspect
 import torch
+import torch.utils.checkpoint
 import numpy as np
 from einops import rearrange
 from PIL import Image
@@ -21,9 +22,11 @@ class LayerEditPipeline(BasePipeline):
     """
     Image -> Live2D layered PSD.
 
-    Latent layout: (1, 16, 1 + n, H // 8, W // 8)
-        frame 0    : layer_input_image (clean, fused into the latents like image-to-video)
-        frame 1..n : the n RGBA layers to be generated
+    Latent layout (as Qwen-Image-Layered): (1, 16, 1 + n, H // 8, W // 8), all frames noisy and generated
+        frame 0    : the composite image (layer_input_image)
+        frame 1..n : the n RGBA layers
+    The clean layer_input_image latents (first_frame_latents) are the condition, appended by the DiT.
+    Scheduler: FlowMatchScheduler("Qwen-Image"), resolution-dependent shift at inference, like Qwen-Image-Layered.
     """
 
     def __init__(self, device=get_device_type(), torch_dtype=torch.bfloat16):
@@ -33,7 +36,7 @@ class LayerEditPipeline(BasePipeline):
         )
         from transformers import Qwen2Tokenizer
 
-        self.scheduler = FlowMatchScheduler("Wan")
+        self.scheduler = FlowMatchScheduler("Qwen-Image")
         self.text_encoder: QwenImageTextEncoder = None
         self.dit: LayerEditDiT = None
         self.vae: QwenImageVAE = None
@@ -108,7 +111,7 @@ class LayerEditPipeline(BasePipeline):
         rand_device: str = "cpu",
         # Steps
         num_inference_steps: int = 50,
-        sigma_shift: float = 5.0,
+        exponential_shift_mu: float = None,
         # Progress bar
         progress_bar_cmd = tqdm,
     ):
@@ -116,7 +119,9 @@ class LayerEditPipeline(BasePipeline):
             width, height = layer_input_image.size
 
         # Scheduler
-        self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
+        height, width = self.check_resize_height_width(height, width)
+        self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength,
+                                     dynamic_shift_len=(height // 16) * (width // 16), exponential_shift_mu=exponential_shift_mu)
 
         # Parameters
         inputs_posi = {
@@ -149,10 +154,8 @@ class LayerEditPipeline(BasePipeline):
                 **models, timestep=timestep, progress_id=progress_id
             )
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
-            if "first_frame_latents" in inputs_shared:
-                inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
 
-        # Decode (skip the condition frame)
+        # Decode the layers (frame 0 is the generated composite image, skipped like in Qwen-Image-Layered)
         self.load_models_to_device(["vae"])
         latents = inputs_shared["latents"]
         # The DiT did not denoise the tokens outside the masks, these regions are transparent.
@@ -160,8 +163,7 @@ class LayerEditPipeline(BasePipeline):
         if not keep.all():
             transparent = Image.new("RGBA", (inputs_shared["width"], inputs_shared["height"]), (0, 0, 0, 0))
             latents = torch.where(keep, latents, self.encode_rgba_image(transparent, inputs_shared["height"], inputs_shared["width"]))
-        if "first_frame_latents" in inputs_shared:
-            latents = latents[:, :, inputs_shared["first_frame_latents"].shape[2]:]
+        latents = latents[:, :, 1:]
         layers = []
         for layer_id in range(latents.shape[2]):
             image = self.vae.decode(latents[:, :, layer_id])
@@ -192,7 +194,7 @@ class LayerEditUnit_NoiseInitializer(PipelineUnit):
         )
 
     def process(self, pipe: LayerEditPipeline, height, width, layer_num, seed, rand_device):
-        # 1 condition frame + layer_num layers
+        # The composite frame + layer_num layers
         noise = pipe.generate_noise((1, 16, 1 + layer_num, height // 8, width // 8), seed=seed, rand_device=rand_device, rand_torch_dtype=pipe.torch_dtype)
         return {"noise": noise}
 
@@ -221,9 +223,8 @@ class LayerEditUnit_PromptEmbedder(QwenImageUnit_PromptEmbedder):
 
 class LayerEditUnit_LayerInputImageEmbedder(PipelineUnit):
     """
-    Encode layer_input_image with the RGBA VAE and fuse it into the first frame of the latents,
-    in the same way as Wan2.2-TI2V image-to-video generation. The DiT also appends it
-    (with an all-ones mask) after the latent tokens on the sequence-token dimension before img_in.
+    Encode layer_input_image with the RGBA VAE: the condition (layer_input_latents of Qwen-Image-Layered), appended
+    by the DiT after the latent tokens with an all-ones mask, and the target of the composite frame 0 in training.
     """
     def __init__(self):
         super().__init__(
@@ -243,9 +244,9 @@ class LayerEditUnit_LayerInputImageEmbedder(PipelineUnit):
 
 class LayerEditUnit_InputLayersEmbedder(PipelineUnit):
     """
-    Build the initial latents: [layer_input_image | noise of n layers].
+    Build the initial latents: noise for all 1 + n frames (as Qwen-Image-Layered, frame 0 is generated too).
     During training, `input_image` contains the n target layers and `input_latents` is
-    [layer_input_image | n target layers].
+    [layer_input_image (composite) | n target layers].
     """
     def __init__(self):
         super().__init__(
@@ -256,8 +257,6 @@ class LayerEditUnit_InputLayersEmbedder(PipelineUnit):
 
     def process(self, pipe: LayerEditPipeline, input_image, noise, first_frame_latents, height, width):
         latents = noise.clone()
-        if first_frame_latents is not None:
-            latents[:, :, 0:1] = first_frame_latents
         if input_image is None:
             return {"latents": latents}
         pipe.load_models_to_device(self.onload_model_names)
@@ -274,8 +273,6 @@ class LayerEditUnit_InputLayersEmbedder(PipelineUnit):
             return {"latents": latents, "input_latents": input_latents}
         else:
             latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
-            if first_frame_latents is not None:
-                latents[:, :, 0:1] = first_frame_latents
             return {"latents": latents, "input_latents": input_latents}
 
 
@@ -287,8 +284,8 @@ class LayerEditUnit_MaskEmbedder(PipelineUnit):
         Missing entries (None, or a list shorter than 1 + n) default to all-white (= 1).
         -> RGB values only (alpha is ignored) -> luminance -> single-channel tensors in [0, 1] (white = 1, black = 0)
         -> downsampled to the latent resolution
-        -> replicated to `dit.mask_dim` (4) channels
-        -> masks (1, 4, 1 + n, H // 8, W // 8)
+        -> `dit.mask_dim` (1) channel
+        -> masks (1, 1, 1 + n, H // 8, W // 8)
     The DiT concatenates masks with the latents on the channel dimension before patchify.
     """
     def __init__(self):
@@ -319,7 +316,7 @@ class LayerEditUnit_MaskEmbedder(PipelineUnit):
         masks = torch.nn.functional.interpolate(masks.unsqueeze(1), size=(height // 8, width // 8), mode="area")  # (1 + n, 1, h, w)
         # The DiT is not loaded in the data process stage (caching), so fall back to its default mask_dim.
         mask_dim = pipe.dit.mask_dim if pipe.dit is not None else inspect.signature(LayerEditDiT).parameters["mask_dim"].default
-        masks = masks.repeat(1, mask_dim, 1, 1)  # (1 + n, 4, h, w)
+        masks = masks.repeat(1, mask_dim, 1, 1)  # (1 + n, mask_dim, h, w)
         masks = rearrange(masks, "f c h w -> 1 c f h w")
         return {"masks": masks.to(dtype=pipe.torch_dtype, device=pipe.device)}
 
@@ -348,16 +345,26 @@ def parse_rgba_loss_blocks(config: str):
 
 
 
-def rgba_losses(pipe: LayerEditPipeline, x0_pred: torch.Tensor, x0_target: torch.Tensor):
+def rgba_losses(pipe: LayerEditPipeline, x0_pred: torch.Tensor, x0_target: torch.Tensor, max_frames: int = None):
     """
     Decode the predicted / target latents with the (frozen) RGBA VAE and return (rgb_loss, alpha_loss).
     The RGB loss is weighted by the target alpha, since colors of transparent pixels are meaningless.
+    With `max_frames`, the losses are computed on that many random frames (layers), an unbiased estimate of the mean.
     """
     x0_pred = rearrange(x0_pred, "b c f h w -> (b f) c h w").to(pipe.torch_dtype)
     x0_target = rearrange(x0_target, "b c f h w -> (b f) c h w").to(pipe.torch_dtype)
-    image_pred = pipe.vae.decode(x0_pred).float().clamp(-1, 1)
+    if max_frames is not None and x0_pred.shape[0] > max_frames:
+        frames = torch.randperm(x0_pred.shape[0], device=x0_pred.device)[:max_frames]
+        x0_pred, x0_target = x0_pred[frames], x0_target[frames]
+    # One frame at a time, and the decoder activations are recomputed in the backward pass, so the memory is that of
+    # a single frame whatever the number of layers (a sample can have hundreds).
+    decode = lambda x: pipe.vae.decode(x).float().clamp(-1, 1)
+    image_pred = torch.cat([
+        torch.utils.checkpoint.checkpoint(decode, frame, use_reentrant=False) if frame.requires_grad else decode(frame)
+        for frame in x0_pred.split(1)
+    ])
     with torch.no_grad():
-        image_target = pipe.vae.decode(x0_target).float().clamp(-1, 1)
+        image_target = torch.cat([decode(frame) for frame in x0_target.split(1)])
     alpha_pred = (image_pred[:, 3:4] + 1) / 2
     alpha_target = (image_target[:, 3:4] + 1) / 2
     alpha_loss = torch.nn.functional.mse_loss(alpha_pred, alpha_target)
@@ -367,10 +374,24 @@ def rgba_losses(pipe: LayerEditPipeline, x0_pred: torch.Tensor, x0_target: torch
 
 
 
+def alpha_time_weight(sigma: float, sigma_start: float = 0.85, sigma_end: float = 0.3) -> float:
+    """
+    w(sigma) of the time-weighted alpha loss: 1 for sigma >= sigma_start (early denoising), 0 for sigma <= sigma_end
+    (late denoising), and a smoothstep in between, so the weight and its slope are continuous.
+    """
+    s = min(max((sigma - sigma_end) / (sigma_start - sigma_end), 0.0), 1.0)
+    return s * s * (3 - 2 * s)
+
+
+
 def LayerEditRGBALoss(
     pipe: LayerEditPipeline,
     rgba_loss_blocks: list = (),
     sparse_tokens: bool = True,
+    alpha_loss_weight: float = 0.0,
+    alpha_sigma_start: float = 0.85,
+    alpha_sigma_end: float = 0.3,
+    alpha_max_frames: int = 4,
     **inputs,
 ):
     """
@@ -399,6 +420,11 @@ def LayerEditRGBALoss(
           the group's parameters equals w_rgb * dL_rgb/dθ + w_a * dL_a/dθ exactly, and it cannot
           reach any other parameter.
     The returned loss value is therefore not the sum of all losses; only its gradient is meaningful.
+
+    Time-weighted alpha loss (`alpha_loss_weight` > 0, loss_type alpha_t): at every timestep, the pixel-space alpha loss
+    of the decoded x0 = x_t - sigma * v is added to the flow-matching loss as alpha_loss_weight * w(sigma) * alpha_loss,
+    with w from `alpha_time_weight` (1 early, 0 late). It back-propagates through the whole DiT, like the flow-matching loss.
+    The decode is skipped when w = 0, and the loss uses at most `alpha_max_frames` random layers per step.
     """
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
@@ -410,10 +436,10 @@ def LayerEditRGBALoss(
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
     training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
 
-    num_condition_layers = 0
-    if "first_frame_latents" in inputs:
-        num_condition_layers = inputs["first_frame_latents"].shape[2]
-        inputs["latents"][:, :, :num_condition_layers] = inputs["first_frame_latents"]
+    # Frame 0 is the composite image: generated like the layers (Qwen-Image-Layered), so it is in the flow-matching
+    # loss when its target (layer_input_image) is known. The RGB / alpha losses only use the layers (frames 1..n).
+    first_flow_frame = 0 if inputs.get("first_frame_latents") is not None else 1
+    first_layer_frame = 1  # frame 0 is the composite
 
     # 1. Full DiT forward pass
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
@@ -421,11 +447,24 @@ def LayerEditRGBALoss(
     output = pipe.model_fn(**models, **inputs, timestep=timestep, sparse_tokens=sparse_tokens, return_hidden_states=use_rgba_loss)
     noise_pred, hidden_states, block_kwargs = output if use_rgba_loss else (output, None, None)
 
-    keep = pipe.dit.kept_latents(inputs.get("masks") if sparse_tokens else None, inputs["latents"])[:, :, num_condition_layers:]
+    keep_all = pipe.dit.kept_latents(inputs.get("masks") if sparse_tokens else None, inputs["latents"])
+    keep = keep_all[:, :, first_layer_frame:]
     training_weight = pipe.scheduler.training_weight(timestep)
-    error = (noise_pred[:, :, num_condition_layers:].float() - training_target[:, :, num_condition_layers:].float()).pow(2)
-    keep_error = keep.expand_as(error)
+    error = (noise_pred[:, :, first_flow_frame:].float() - training_target[:, :, first_flow_frame:].float()).pow(2)
+    keep_error = keep_all[:, :, first_flow_frame:].expand_as(error)
     loss = (error * keep_error).sum() / keep_error.sum().clamp_min(1) * training_weight
+
+    if alpha_loss_weight > 0:
+        sigma = pipe.scheduler.sigmas[timestep_id].item()
+        weight = alpha_time_weight(sigma, alpha_sigma_start, alpha_sigma_end)
+        if weight > 0:
+            if pipe.vae is None:
+                raise ValueError("The alpha loss requires the RGBA VAE. Please add it to `--model_id_with_origin_paths` or `--model_paths`.")
+            # x0 keeps the graph of v, so the alpha loss reaches every DiT parameter. Dropped tokens take the target.
+            x0_target = inputs["input_latents"][:, :, first_layer_frame:]
+            x0_pred = inputs["latents"][:, :, first_layer_frame:] - sigma * noise_pred[:, :, first_layer_frame:]
+            _, alpha_loss = rgba_losses(pipe, torch.where(keep, x0_pred, x0_target), x0_target, max_frames=alpha_max_frames)
+            loss = loss + alpha_loss_weight * weight * alpha_loss
     if not use_rgba_loss:
         return loss
 
@@ -439,10 +478,10 @@ def LayerEditRGBALoss(
 
     # 2. Decode the predicted x0 and compute the RGB / alpha losses.
     #    The gradients are taken w.r.t. a detached copy of v, so the DiT graph is not touched here.
-    noise_pred_layers = noise_pred[:, :, num_condition_layers:].detach().requires_grad_(True)
+    noise_pred_layers = noise_pred[:, :, first_layer_frame:].detach().requires_grad_(True)
     sigma = pipe.scheduler.sigmas[timestep_id].to(dtype=noise_pred.dtype, device=noise_pred.device)
-    x0_pred = inputs["latents"][:, :, num_condition_layers:] - sigma * noise_pred_layers
-    x0_target = inputs["input_latents"][:, :, num_condition_layers:]
+    x0_pred = inputs["latents"][:, :, first_layer_frame:] - sigma * noise_pred_layers
+    x0_target = inputs["input_latents"][:, :, first_layer_frame:]
     rgb_loss, alpha_loss = rgba_losses(pipe, torch.where(keep, x0_pred, x0_target), x0_target)
     grad_rgb, = torch.autograd.grad(rgb_loss, noise_pred_layers, retain_graph=True)
     grad_alpha, = torch.autograd.grad(alpha_loss, noise_pred_layers)
@@ -455,7 +494,7 @@ def LayerEditRGBALoss(
     grad_groups = []
     for grad_layers in (grad_rgb, grad_alpha):
         grad_output = torch.zeros_like(noise_pred)
-        grad_output[:, :, num_condition_layers:] = grad_layers * training_weight
+        grad_output[:, :, first_layer_frame:] = grad_layers * training_weight
         grad_groups.append(torch.autograd.grad(noise_pred, group_outputs, grad_outputs=grad_output, retain_graph=True))
     del group_outputs, grad_output, grad_rgb, grad_alpha
     detached_kwargs = {key: value.detach() if isinstance(value, torch.Tensor) else value for key, value in block_kwargs.items()}
@@ -483,17 +522,18 @@ def model_fn_layer_edit(
     masks=None,
     first_frame_latents=None,
     sparse_tokens=True,
+    zero_cond_t=False,
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
     return_hidden_states=False,
     **kwargs,
 ):
-    num_condition_layers = 0 if first_frame_latents is None else first_frame_latents.shape[2]
     return dit(
         latents, timestep, context,
         masks=masks,
-        num_condition_layers=num_condition_layers,
+        condition_latents=first_frame_latents,
         sparse_tokens=sparse_tokens,
+        zero_cond_t=zero_cond_t,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         return_hidden_states=return_hidden_states,

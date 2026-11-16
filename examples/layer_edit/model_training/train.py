@@ -73,6 +73,10 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
         rgba_loss_blocks=None,
         loss_type="rgba",
         sparse_tokens=True,
+        alpha_loss_weight=0.005,
+        alpha_sigma_start=0.85,
+        alpha_sigma_end=0.3,
+        alpha_max_frames=4,
     ):
         super().__init__()
         # Warning
@@ -104,8 +108,11 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
         # loss_type:
         #   flow_match: the flow-matching loss only (LayerEditRGBALoss without block groups), averaged over the tokens inside the masks
         #   rgba      : flow-matching loss + block-routed RGB / alpha losses (LayerEditRGBALoss)
-        if loss_type not in ("flow_match", "rgba"):
-            raise ValueError(f"Unknown loss_type `{loss_type}`, expected `flow_match` or `rgba`.")
+        #   alpha_t   : flow-matching loss + alpha_loss_weight * w(sigma) * pixel alpha loss at every timestep, w = 1 early, 0 late
+        if loss_type not in ("flow_match", "rgba", "alpha_t"):
+            raise ValueError(f"Unknown loss_type `{loss_type}`, expected `flow_match`, `rgba` or `alpha_t`.")
+        if loss_type == "alpha_t" and not alpha_sigma_start > alpha_sigma_end:
+            raise ValueError(f"alpha_sigma_start ({alpha_sigma_start}) must be larger than alpha_sigma_end ({alpha_sigma_end}).")
         self.loss_type = loss_type
         if rgba_loss_blocks is None:
             rgba_loss_blocks = DEFAULT_RGBA_LOSS_BLOCKS if self.pipe.dit is None else cyclic_rgba_loss_blocks(len(self.pipe.dit.blocks), self.pipe.dit.cycle_length)
@@ -115,7 +122,10 @@ class LayerEditTrainingModule(DiffusionTrainingModule):
             check_rgba_loss_blocks(self.pipe.dit, self.rgba_loss_blocks)
         # Passed here and not in get_pipeline_inputs: the sft:train task reads its inputs from the cache.
         print(f"Sparse tokens: {sparse_tokens}.")
-        sft_loss = lambda pipe, inputs_shared, inputs_posi, inputs_nega: LayerEditRGBALoss(pipe, rgba_loss_blocks=self.rgba_loss_blocks, sparse_tokens=sparse_tokens, **inputs_shared, **inputs_posi)
+        alpha_kwargs = {"alpha_loss_weight": alpha_loss_weight if loss_type == "alpha_t" else 0.0, "alpha_sigma_start": alpha_sigma_start, "alpha_sigma_end": alpha_sigma_end, "alpha_max_frames": alpha_max_frames}
+        if loss_type == "alpha_t":
+            print(f"Time-weighted alpha loss: {alpha_kwargs}.")
+        sft_loss = lambda pipe, inputs_shared, inputs_posi, inputs_nega: LayerEditRGBALoss(pipe, rgba_loss_blocks=self.rgba_loss_blocks, sparse_tokens=sparse_tokens, **alpha_kwargs, **inputs_shared, **inputs_posi)
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -185,7 +195,14 @@ def layer_edit_parser():
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
-    parser.add_argument("--loss_type", type=str, default="rgba", choices=["flow_match", "rgba"], help="flow_match: the common flow-matching loss only. rgba: flow-matching loss + block-routed RGB / alpha losses (see --rgba_loss_blocks).")
+    parser.add_argument("--loss_type", type=str, default="rgba", choices=["flow_match", "rgba", "alpha_t"], help="flow_match: the common flow-matching loss only. rgba: flow-matching loss + block-routed RGB / alpha losses (see --rgba_loss_blocks). alpha_t: flow-matching loss + time-weighted pixel alpha loss (see --alpha_loss_weight).")
+    # Defaults from measured magnitudes (measured with the earlier Wan shift-5 scheduler, the pipeline now uses Qwen-Image's):
+    # unweighted, the alpha gradient w.r.t. v is 50-800x the flow-matching gradient for sigma > 0.8, so 0.005 makes it
+    # about half a typical flow-matching gradient at full weight. The weights act per sigma, so they still apply.
+    parser.add_argument("--alpha_loss_weight", type=float, default=0.005, help="alpha_t: weight of the pixel alpha loss at full time weight (default: 0.005).")
+    parser.add_argument("--alpha_sigma_start", type=float, default=0.85, help="alpha_t: w(sigma) = 1 for sigma >= this (early denoising, default: 0.85).")
+    parser.add_argument("--alpha_max_frames", type=int, default=4, help="alpha_t: random layers per step that get the alpha loss, bounds the decode time and memory (default: 4).")
+    parser.add_argument("--alpha_sigma_end", type=float, default=0.3, help="alpha_t: w(sigma) = 0 for sigma <= this (late denoising, default: 0.3), smoothstep in between.")
     parser.add_argument("--rgba_loss_blocks", type=str, default=None, help="RGB / alpha losses (VAE-decoded prediction vs. GT) and the DiT blocks they update, as comma-separated `first-last:rgb_weight:alpha_weight`. Default: cyclic (A, B, B) over all DiT blocks (* 20 for 60 blocks), A blocks 0.2:0.8, B blocks 0.8:0.2. Other parameters only receive the flow-matching gradient. Empty string disables them.")
     parser.add_argument("--sparse_tokens", default=True, action=argparse.BooleanOptionalAction, help="Only the tokens inside the masks enter the DiT (default). --no-sparse_tokens: all tokens enter the DiT, and the masks still enter as input channels.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
@@ -256,6 +273,10 @@ if __name__ == "__main__":
         rgba_loss_blocks=args.rgba_loss_blocks,
         loss_type=args.loss_type,
         sparse_tokens=args.sparse_tokens,
+        alpha_loss_weight=args.alpha_loss_weight,
+        alpha_sigma_start=args.alpha_sigma_start,
+        alpha_sigma_end=args.alpha_sigma_end,
+        alpha_max_frames=args.alpha_max_frames,
     )
     model_logger = ModelLogger(
         args.output_path,

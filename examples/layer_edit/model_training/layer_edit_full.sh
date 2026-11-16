@@ -18,7 +18,10 @@
 # Loss type (the only switch, set LOSS_TYPE below or `LOSS_TYPE=flow_match bash layer_edit_full.sh`):
 #   flow_match: the flow-matching loss only, averaged over the tokens inside the masks
 #   rgba      : flow-matching loss + block-routed RGB / alpha losses, described below
-LOSS_TYPE=${LOSS_TYPE:-flow_match}
+#   alpha_t   : flow-matching loss + 0.005 * w(sigma) * pixel alpha loss at every timestep (all parameters).
+#               w = 1 for sigma >= 0.85 (early denoising), smoothstep down to 0 at sigma <= 0.3 (late denoising).
+#               Tune with --alpha_loss_weight / --alpha_sigma_start / --alpha_sigma_end.
+LOSS_TYPE=${LOSS_TYPE:-alpha_t}
 # Losses of LOSS_TYPE=rgba (one training run, every iteration):
 #   flow-matching loss: all parameters
 #   RGB / alpha losses (VAE-decoded x0 prediction vs. GT RGBA), routed to specific blocks only:
@@ -33,9 +36,9 @@ LOSS_TYPE=${LOSS_TYPE:-flow_match}
 #   --output_path "models/LayerEdit/layer_edit_dit.safetensors"
 
 # Step 1: cache VAE latents (layers, layer_input_image, masks) and text embeddings
-# accelerate launch examples/layer_edit/model_training/train.py \
-#   --dataset_base_path data/psd/output \
-#   --dataset_metadata_path data/psd/merged_output.json \
+# nohup accelerate launch examples/layer_edit/model_training/train.py \
+#   --dataset_base_path data/psd/layers_grouped_coarse_output \
+#   --dataset_metadata_path data/psd/layers_grouped_coarse_output/merged_output.json \
 #   --data_file_keys "image,layer_input_image,mask" \
 #   --max_pixels 100000 \
 #   --dataset_repeat 1 \
@@ -57,7 +60,7 @@ nohup accelerate launch --config_file examples/layer_edit/model_training/full/ac
   --data_file_keys "image,layer_input_image,mask" \
   --max_pixels 100000 \
   --dataset_repeat 1 \
-  --model_paths '["models/LayerEdit/layer_edit_dit_init_from_qwen.safetensors"]' \
+  --model_paths '["models/train/LayerEdit_full_alpha_t/1114/epoch-0.safetensors"]' \
   --model_id_with_origin_paths "Qwen/Qwen-Image-Layered:vae/diffusion_pytorch_model.safetensors" \
   --learning_rate 1e-5 \
   --num_epochs 5 \

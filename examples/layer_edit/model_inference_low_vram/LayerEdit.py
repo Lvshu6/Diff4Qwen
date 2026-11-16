@@ -5,11 +5,11 @@ import torch, json, os, argparse
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dit_path", type=str, default="models/train/LayerEdit_full_flow_match/epoch-3.safetensors")
-parser.add_argument("--dataset_base_path", type=str, default="data/psd/output")
-parser.add_argument("--metadata_path", type=str, default="data/psd/output/test.json")
-parser.add_argument("--output_path", type=str, default="models/train/LayerEdit_full_flow_match/inference/3_7/epoch-3")
-parser.add_argument("--max_pixels", type=int, default=262144)
+parser.add_argument("--dit_path", type=str, default="models/train/LayerEdit_full_alpha_t/1114/epoch-2.safetensors")
+parser.add_argument("--dataset_base_path", type=str, default="data/psd/layers_grouped_coarse_output")
+parser.add_argument("--metadata_path", type=str, default="data/psd/layers_grouped_coarse_output/test.json")
+parser.add_argument("--output_path", type=str, default="models/train/LayerEdit_full_alpha_t/inference/1114/epoch-2")
+parser.add_argument("--max_pixels", type=int, default=100000)
 parser.add_argument("--num_inference_steps", type=int, default=50)
 parser.add_argument("--cfg_scale", type=float, default=4.0)
 parser.add_argument("--seed", type=int, default=0)
@@ -39,6 +39,7 @@ pipe = LayerEditPipeline.from_pretrained(
         ModelConfig(model_id="Qwen/Qwen-Image-Layered", origin_file_pattern="vae/diffusion_pytorch_model.safetensors", **vram_config),
     ],
     tokenizer_config=ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="tokenizer/"),
+    vram_limit=60,
 )
 
 # Same resolution rule as training (max_pixels, divisible by 16)

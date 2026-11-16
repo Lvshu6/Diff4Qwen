@@ -7,30 +7,30 @@ Usage:
 
 Source: Qwen-Image-Layered, MMDiT with 60 dual-stream blocks, dim 3072, 24 heads x 128, MLP 12288.
 Target: LayerEditDiT, the same blocks without the text stream (the text tokens from text_embedding are
-        never updated). Every block parameter has the same name and shape as in the source, so the blocks
-        are copied as they are. The mask design differs from Qwen-Image-Layered: parameters without a
-        counterpart are randomly initialized (LayerEditDiT.init_weights).
+        never updated), the same layer-order RoPE (QwenEmbedLayer3DRope), timestep embedding and head. Every
+        block parameter has the same name and shape as in the source, so the blocks are copied as they are.
 
 Mapping (source -> target):
-    img_in [3072, 64] (C P Q)        -> img_in [3072, 80] (P Q C), 16 latent channels permuted, 4 mask channels random
+    img_in [3072, 64] (C P Q)        -> img_in [3072, 68] (P Q C), 16 latent channels permuted, 1 mask channel zero
     time_text_embed.timestep_embedder -> time_embedding (same sinusoidal embedding, t in [0, 1000], cos first)
     addition_t_embedding[0]          -> folded into time_embedding.2.bias (Qwen-Image-Layered always uses index 0)
     txt_norm, txt_in                 -> text_embedding.0, text_embedding.1
     transformer_blocks.j.<name>      -> blocks.j.<name> (img_mod, attn.to_q/k/v/to_out, attn.norm_q/k,
                                         attn.add_k/v_proj, attn.norm_added_k, img_mlp)
+    transformer_blocks.j.txt_mod     -> blocks.j.txt_mod, rows [0, 2 * dim): the (shift, scale) of the attention
     norm_out.linear                  -> head.linear
     proj_out [64, 3072] (C P Q)      -> head.head [64, 3072] (P Q C)
 
-Dropped (the text stream): txt_mod, txt_mlp, attn.add_q_proj, attn.norm_added_q, attn.to_add_out.
+Dropped (the text is not updated): txt_mlp, the gate and MLP rows of txt_mod, attn.add_q_proj, attn.norm_added_q,
+attn.to_add_out.
 
-Randomly initialized (no counterpart): the mask columns of img_in. Any other parameter that is missing
-in the source is also kept at its random initialization and listed in the log.
+Zero-initialized (no counterpart): the mask columns of img_in, so the masks change nothing at initialization.
+Any other parameter that is missing in the source keeps its random initialization and is listed in the log.
 
-Not representable without changing the architecture (fine-tuning has to adapt them):
-    - RoPE: Qwen uses axes (16, 56, 56) with centered positions, LayerEditDiT uses (44, 42, 42) from 0,
-      and the text tokens get no RoPE.
-    - The text tokens are neither updated nor modulated (txt_norm1 + txt_mod) by the blocks, so the text
-      keys / values differ from Qwen in every block. The image stream of a block is otherwise exact.
+Not representable without updating the text (fine-tuning has to adapt it): from the second block on, Qwen's text
+has been updated by the blocks before, LayerEditDiT's has not. The text is normalized and modulated like in Qwen,
+so the first block is exact, and without text tokens the whole model reproduces Qwen-Image-Layered
+(sparse_tokens=False, any masks, as their columns are zero).
 """
 import torch, os, re, glob, json, argparse
 from safetensors import safe_open
@@ -66,10 +66,10 @@ class QwenSource:
         return self.index[key].get_tensor(key).float()
 
 
-def permute_img_in(weight, init, in_dim=16, mask_dim=4):
+def permute_img_in(weight, init, in_dim=16, mask_dim=1):
     # Qwen patch features are (C P Q), LayerEditDiT patchify gives (P Q C) with C = in_dim + mask_dim (p = 1 for the layer axis).
-    # Mask channels keep the columns of `init` (random), they have no counterpart in Qwen-Image-Layered.
-    out = init.float().clone()
+    # Mask channels are zero, they have no counterpart in Qwen-Image-Layered: at initialization the masks change nothing.
+    out = torch.zeros_like(init, dtype=torch.float32)
     for q in range(2):
         for r in range(2):
             for c in range(in_dim):
@@ -122,7 +122,12 @@ def init_from_qwen_layered(model: LayerEditDiT, source: QwenSource):
         raise ValueError(f"LayerEditDiT has {len(model.blocks)} blocks, Qwen-Image-Layered has {source.num_blocks}.")
     for name in params:
         if (m := re.match(r"blocks\.(\d+)\.(.+)", name)):
-            copy_if_exists(name, f"transformer_blocks.{m.group(1)}.{m.group(2)}")
+            key = f"transformer_blocks.{m.group(1)}.{m.group(2)}"
+            if m.group(2).startswith("txt_mod.1."):
+                # Only the (shift, scale) rows of the attention part of Qwen's txt_mod: rows [0, 2 * dim) of 6 * dim.
+                copy(name, source(key)[: 2 * model.dim])
+            else:
+                copy_if_exists(name, key)
 
     # Head
     copy("head.linear.weight", source("norm_out.linear.weight"))
@@ -130,8 +135,8 @@ def init_from_qwen_layered(model: LayerEditDiT, source: QwenSource):
     copy("head.head.weight", permute_head(source("proj_out.weight"), model.out_dim))
     copy("head.head.bias", permute_head(source("proj_out.bias"), model.out_dim))
 
-    # img_in.weight is copied but its mask columns stay random.
-    random_init = ["img_in.weight (mask columns)"] + sorted(set(params) - copied)
+    # img_in.weight is copied, its mask columns are zero.
+    random_init = sorted(set(params) - copied)
     dropped = sorted({re.sub(r"^transformer_blocks\.\d+\.", "transformer_blocks.*.", key) for key in source.index if key not in source.used})
     return dropped, random_init
 
