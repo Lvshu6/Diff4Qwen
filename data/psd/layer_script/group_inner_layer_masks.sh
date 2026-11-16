@@ -1,1 +1,0 @@
-python data/psd/layer_script/group_inner_layer_masks.py data/psd/layers_grouped data/psd/layers_grouped_inner_output --max_pixels 2250000
