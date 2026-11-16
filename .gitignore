@@ -5,6 +5,7 @@
 /.vscode
 /.qoder
 /.opencode
+/.claude
 /hf
 *.pkl
 *.safetensors
